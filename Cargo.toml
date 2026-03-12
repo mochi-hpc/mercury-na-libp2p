@@ -1,0 +1,13 @@
+[package]
+name = "na_plugin_abc"
+version = "0.1.0"
+edition = "2021"
+description = "Mercury NA plugin template (Rust)"
+
+[lib]
+name = "na_plugin_abc"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+bindgen = "0.71"
+pkg-config = "0.3"
