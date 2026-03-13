@@ -101,6 +101,23 @@ add_custom_command(
 )
 add_custom_target(na_plugin_libp2p ALL DEPENDS "${_plugin_so}")
 
+# Relay server binary ----------------------------------------------------------
+set(_relay_server_src "${CMAKE_CURRENT_SOURCE_DIR}/relay-server")
+set(_relay_cargo_target "${_cargo_build_dir}")
+set(_relay_server_bin "${_relay_cargo_target}/release/mercury-na-relay-server")
+
+add_custom_command(
+    OUTPUT "${_relay_server_bin}"
+    COMMAND ${CMAKE_COMMAND} -E env
+        "CARGO_TARGET_DIR=${_relay_cargo_target}"
+        cargo build --release
+        --manifest-path "${_relay_server_src}/Cargo.toml"
+    DEPENDS "${_relay_server_src}/Cargo.toml" "${_relay_server_src}/src/main.rs"
+    COMMENT "Building relay server (cargo build --release)"
+    VERBATIM
+)
+add_custom_target(mercury_na_relay_server ALL DEPENDS "${_relay_server_bin}")
+
 # Installation -----------------------------------------------------------------
 if(NOT NA_PLUGIN_INSTALL_DIR)
     include(GNUInstallDirs)
@@ -109,6 +126,10 @@ endif()
 
 install(FILES "${_plugin_so}"
     DESTINATION ${NA_PLUGIN_INSTALL_DIR}
+)
+
+install(PROGRAMS "${_relay_server_bin}"
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
 # Tests

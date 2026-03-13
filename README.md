@@ -91,16 +91,17 @@ cd build
 NA_PLUGIN_PATH=./cargo-build/release ctest --output-on-failure
 ```
 
-Six test suites are included:
+Seven test suites are included:
 
 | Test | What it covers |
 |------|----------------|
-| `libp2p_init`   | Plugin load, initialize/finalize, protocol info |
-| `libp2p_proc`   | Address serialization round-trip |
-| `libp2p_msg`    | Unexpected and expected message send/recv |
-| `libp2p_lookup` | Address lookup and string conversion |
-| `libp2p_rpc`    | Full Mercury RPC including 16-thread concurrent progress |
-| `libp2p_bulk`   | RMA put/get bulk data transfer |
+| `libp2p_init`      | Plugin load, initialize/finalize, protocol info |
+| `libp2p_proc`      | Address serialization round-trip |
+| `libp2p_msg`       | Unexpected and expected message send/recv |
+| `libp2p_lookup`    | Address lookup and string conversion |
+| `libp2p_rpc`       | Full Mercury RPC including 16-thread concurrent progress |
+| `libp2p_bulk`      | RMA put/get bulk data transfer |
+| `libp2p_relay_msg` | Message send/recv over a relayed connection (3-process) |
 
 ## Using the Plugin
 
@@ -212,7 +213,77 @@ NA_Put(na_class, context, callback, cb_arg,
        remote_addr, 0, op_id);
 ```
 
-### 7. Progress loop
+### 7. Circuit relay
+
+When peers cannot reach each other directly (e.g., behind NAT or
+firewalls), traffic can be routed through an intermediary **relay
+server**. The build produces a standalone relay binary,
+`mercury-na-relay-server`, that is installed alongside the plugin.
+
+#### Start the relay server
+
+```bash
+mercury-na-relay-server \
+    --port 4001 \
+    --secret-key-seed 1 \
+    --addr-file relay_addr.txt
+```
+
+| Flag | Description |
+|------|-------------|
+| `--port <N>` | TCP listen port (`0` for OS-assigned, default `0`) |
+| `--secret-key-seed <N>` | Byte seed for deterministic Ed25519 key (required) |
+| `--addr-file <path>` | Write the relay's full multiaddr to this file once listening (required) |
+
+The relay server logs its multiaddr(s) to stdout and writes the first
+one (with `0.0.0.0` resolved to `127.0.0.1`) to the addr-file. Example
+output:
+
+```
+Relay server PeerId: 12D3KooWPjce...
+Relay listening on /ip4/127.0.0.1/tcp/4001/p2p/12D3KooWPjce...
+```
+
+The relay runs until interrupted with Ctrl-C (SIGINT).
+
+#### Configure NA peers to use the relay
+
+Set the `MERCURY_RELAY_ADDR` environment variable to the relay's
+multiaddr (including its `/p2p/<peer_id>` suffix), and include `relay`
+in the protocol name:
+
+```bash
+export MERCURY_RELAY_ADDR=/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWPjce...
+```
+
+```c
+/* Server — listens via the relay */
+na_class_t *na = NA_Initialize("tcp,relay://", NA_TRUE);
+
+/* Client — connects through the relay */
+na_class_t *na = NA_Initialize("tcp,relay://", NA_FALSE);
+```
+
+The server makes a reservation with the relay and becomes reachable at
+a circuit address. `NA_Addr_self()` returns this circuit address so the
+client can dial through the relay. All subsequent NA operations
+(messaging, RMA) work transparently over the relayed connection.
+
+#### Relay limitations
+
+The relay server uses default libp2p relay v2 limits:
+
+| Parameter | Default |
+|-----------|---------|
+| Max data per circuit | 128 KiB |
+| Max circuit duration | 120 s |
+| Max concurrent reservations | 128 |
+| Max concurrent circuits | 16 |
+
+These limits are suitable for control-plane RPC with small messages.
+For bulk data transfer, use direct connections.
+
+### 8. Progress loop
 
 Drive completion with the standard Mercury progress pattern:
 
@@ -239,6 +310,7 @@ busy-polling.
 | Variable | Description |
 |----------|-------------|
 | `NA_PLUGIN_PATH` | Directory containing `libna_plugin_libp2p.so` (required) |
+| `MERCURY_RELAY_ADDR` | Relay server multiaddr for circuit relay (e.g., `/ip4/.../tcp/.../p2p/12D3KooW...`) |
 | `RUST_LOG` | Controls log verbosity. Examples: `error`, `warn`, `debug`, `na_plugin_libp2p=debug` |
 
 ## Architecture
@@ -287,6 +359,9 @@ src/
   state.rs      # NaLibp2pClass, NaLibp2pAddr, NaLibp2pOpId, NaLibp2pMemHandle
   runtime.rs    # Tokio runtime, swarm task, per-peer sender pool
   protocol.rs   # Wire message format (header + payload framing)
+relay-server/
+  Cargo.toml    # Standalone crate for the relay server binary
+  src/main.rs   # Minimal libp2p relay (TCP + Noise + Yamux + relay behaviour)
 ```
 
 ## Wire Protocol

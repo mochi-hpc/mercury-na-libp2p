@@ -1107,7 +1107,7 @@ The relay test (`libp2p_relay_msg`) uses a 3-process setup orchestrated by
 
 ```
 test_relay_driver.sh
-  ├── test-relay-server       (Rust binary, test/relay-server/)
+  ├── mercury-na-relay-server  (Rust binary, relay-server/)
   │     Listens on port 0, writes address to relay_addr.txt
   │
   ├── test_libp2p_relay_server  (C, links against libna)
@@ -1119,7 +1119,7 @@ test_relay_driver.sh
         initializes with "tcp,relay", exchanges messages through relay
 ```
 
-The test relay server (`test/relay-server/`) is a minimal Rust binary based
+The relay server (`relay-server/`) is a minimal Rust binary based
 on the upstream `rust-libp2p/examples/relay-server`. It differs from the
 example in two ways:
 1. It writes its full multiaddr to `--addr-file` once listening (for

@@ -104,22 +104,8 @@ set_tests_properties(libp2p_init libp2p_proc libp2p_msg libp2p_lookup libp2p_rpc
 # Relay test infrastructure
 # ============================================================
 
-# Build the test relay server (Rust binary)
-set(_relay_server_src "${CMAKE_CURRENT_SOURCE_DIR}/relay-server")
-set(_relay_cargo_target "${CMAKE_CURRENT_BINARY_DIR}/relay-cargo-build")
-set(_relay_server_bin "${_relay_cargo_target}/release/test-relay-server")
-
-add_custom_command(
-    OUTPUT "${_relay_server_bin}"
-    COMMAND ${CMAKE_COMMAND} -E env
-        "CARGO_TARGET_DIR=${_relay_cargo_target}"
-        cargo build --release
-        --manifest-path "${_relay_server_src}/Cargo.toml"
-    DEPENDS "${_relay_server_src}/Cargo.toml" "${_relay_server_src}/src/main.rs"
-    COMMENT "Building test relay server"
-    VERBATIM
-)
-add_custom_target(test_relay_server_bin ALL DEPENDS "${_relay_server_bin}")
+# Relay server binary is built by the parent CMakeLists.txt
+set(_relay_server_bin "${CMAKE_CURRENT_BINARY_DIR}/../cargo-build/release/mercury-na-relay-server")
 
 # Relay message test executables
 add_executable(test_libp2p_relay_server test_libp2p_relay_server.c)
@@ -136,6 +122,8 @@ add_test(NAME libp2p_relay_msg
         ${_relay_server_bin} --port 0 --secret-key-seed 1 --addr-file relay_addr.txt --
         $<TARGET_FILE:test_libp2p_relay_server> -p "tcp,relay" --
         $<TARGET_FILE:test_libp2p_relay_client> -p "tcp,relay")
+add_dependencies(test_libp2p_relay_server mercury_na_relay_server)
+add_dependencies(test_libp2p_relay_client mercury_na_relay_server)
 
 set_tests_properties(libp2p_relay_msg
     PROPERTIES
