@@ -372,14 +372,10 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_lookup(
 
     tracing::debug!("addr_lookup: raw input='{}'", name_str);
 
-    // Strip protocol prefix variants:
-    //   "libp2p+libp2p:", "libp2p:", "tcp:", "quic:", or bare multiaddr
-    // Mercury strips the "libp2p+" prefix before calling us, so we may receive
-    // "tcp:/ip4/...", "quic:/ip4/...", or legacy "libp2p:/ip4/..."
+    // Strip protocol prefix. Mercury strips the "libp2p+" prefix before
+    // calling us, so we receive "tcp:/ip4/..." or "quic:/ip4/...".
     let input = name_str
-        .strip_prefix("libp2p+libp2p:")
-        .or_else(|| name_str.strip_prefix("libp2p:"))
-        .or_else(|| name_str.strip_prefix("tcp:"))
+        .strip_prefix("tcp:")
         .or_else(|| name_str.strip_prefix("quic:"))
         .unwrap_or(&name_str);
 
