@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(na_plugin_abc_rust)
+project(na_plugin_libp2p_rust)
 
 # Find Mercury's NA library (provides include/lib paths)
 find_package(mercury REQUIRED)
@@ -75,7 +75,7 @@ get_filename_component(_mercury_lib_dir "${_na_loc}" DIRECTORY)
 # Cargo output directory inside the build tree
 set(_cargo_build_dir "${CMAKE_CURRENT_BINARY_DIR}/cargo-build")
 set(_cargo_target_dir "${_cargo_build_dir}")
-set(_plugin_so "${_cargo_build_dir}/release/libna_plugin_abc.so")
+set(_plugin_so "${_cargo_build_dir}/release/libna_plugin_libp2p.so")
 
 # Build the Rust plugin via cargo
 add_custom_command(
@@ -92,11 +92,14 @@ add_custom_command(
         "${CMAKE_CURRENT_SOURCE_DIR}/wrapper.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/lib.rs"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/plugin.rs"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/state.rs"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime.rs"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/protocol.rs"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     COMMENT "Building Rust NA plugin (cargo build --release)"
     VERBATIM
 )
-add_custom_target(na_plugin_abc ALL DEPENDS "${_plugin_so}")
+add_custom_target(na_plugin_libp2p ALL DEPENDS "${_plugin_so}")
 
 # Installation -----------------------------------------------------------------
 if(NOT NA_PLUGIN_INSTALL_DIR)

@@ -2,7 +2,7 @@
 #
 # After renaming the plugin with rename-plugin.sh, the test files and
 # targets are updated automatically (the rename script handles the
-# test_abc_* -> test_<name>_* renaming).
+# test_libp2p_* -> test_<name>_* renaming).
 
 # Make test headers available
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -16,16 +16,16 @@ add_library(na_test_common_lib STATIC
 target_link_libraries(na_test_common_lib PRIVATE na mercury_util)
 
 # Init/finalize smoke test
-add_executable(test_abc_init test_abc_init.c)
-target_link_libraries(test_abc_init PRIVATE na)
+add_executable(test_libp2p_init test_libp2p_init.c)
+target_link_libraries(test_libp2p_init PRIVATE na)
 
 # Message test - server
-add_executable(test_abc_msg_server test_abc_msg_server.c)
-target_link_libraries(test_abc_msg_server PRIVATE na)
+add_executable(test_libp2p_msg_server test_libp2p_msg_server.c)
+target_link_libraries(test_libp2p_msg_server PRIVATE na)
 
 # Message test - client
-add_executable(test_abc_msg_client test_abc_msg_client.c)
-target_link_libraries(test_abc_msg_client PRIVATE na)
+add_executable(test_libp2p_msg_client test_libp2p_msg_client.c)
+target_link_libraries(test_libp2p_msg_client PRIVATE na)
 
 # Integration tests (adapted from Mercury's Testing/unit/na/)
 # Lookup test - server
@@ -71,31 +71,31 @@ target_link_libraries(test_proc PRIVATE hg_test_common_lib)
 set(TEST_DRIVER ${CMAKE_CURRENT_SOURCE_DIR}/test_driver.sh)
 
 # Standalone tests
-add_test(NAME abc_init COMMAND test_abc_init -p abc)
-add_test(NAME abc_proc COMMAND test_proc)
+add_test(NAME libp2p_init COMMAND test_libp2p_init -p libp2p)
+add_test(NAME libp2p_proc COMMAND test_proc)
 
 # Server+client tests
-add_test(NAME abc_msg
+add_test(NAME libp2p_msg
     COMMAND ${TEST_DRIVER}
-        $<TARGET_FILE:test_abc_msg_server> -p abc --
-        $<TARGET_FILE:test_abc_msg_client> -p abc)
+        $<TARGET_FILE:test_libp2p_msg_server> -p libp2p --
+        $<TARGET_FILE:test_libp2p_msg_client> -p libp2p)
 
-add_test(NAME abc_lookup
+add_test(NAME libp2p_lookup
     COMMAND ${TEST_DRIVER}
-        $<TARGET_FILE:test_lookup_server> -p abc --
-        $<TARGET_FILE:test_lookup> -p abc)
+        $<TARGET_FILE:test_lookup_server> -p libp2p --
+        $<TARGET_FILE:test_lookup> -p libp2p)
 
-add_test(NAME abc_rpc
+add_test(NAME libp2p_rpc
     COMMAND ${TEST_DRIVER}
-        $<TARGET_FILE:test_hg_server> -p abc --
-        $<TARGET_FILE:test_rpc> -p abc)
+        $<TARGET_FILE:test_hg_server> -p libp2p --
+        $<TARGET_FILE:test_rpc> -p libp2p)
 
-add_test(NAME abc_bulk
+add_test(NAME libp2p_bulk
     COMMAND ${TEST_DRIVER}
-        $<TARGET_FILE:test_hg_server> -p abc --
-        $<TARGET_FILE:test_bulk> -p abc)
+        $<TARGET_FILE:test_hg_server> -p libp2p --
+        $<TARGET_FILE:test_bulk> -p libp2p)
 
 # All tests need NA_PLUGIN_PATH to find the Rust plugin (.so is in cargo-build/release/)
 set(_na_plugin_dir "${CMAKE_CURRENT_BINARY_DIR}/../cargo-build/release")
-set_tests_properties(abc_init abc_proc abc_msg abc_lookup abc_rpc abc_bulk
+set_tests_properties(libp2p_init libp2p_proc libp2p_msg libp2p_lookup libp2p_rpc libp2p_bulk
     PROPERTIES ENVIRONMENT "NA_PLUGIN_PATH=${_na_plugin_dir}")

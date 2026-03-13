@@ -8,7 +8,7 @@
  * 5. Send expected reply to client
  * 6. Finalize
  *
- * Usage: test_abc_msg_server [-p <protocol>]
+ * Usage: test_libp2p_msg_server [-p <protocol>]
  */
 
 #include <na.h>
@@ -112,7 +112,7 @@ progress_loop(struct server_state *state, bool *flag)
 int
 main(int argc, char *argv[])
 {
-    const char *protocol = "abc";
+    const char *protocol = "libp2p";
     char info_string[256];
     struct server_state state;
     na_op_id_t *op_id = NULL;

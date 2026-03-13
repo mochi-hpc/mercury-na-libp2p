@@ -9,7 +9,7 @@
  * 6. Recv expected reply from server
  * 7. Finalize
  *
- * Usage: test_abc_msg_client [-p <protocol>]
+ * Usage: test_libp2p_msg_client [-p <protocol>]
  */
 
 #include <na.h>
@@ -97,7 +97,7 @@ progress_loop(struct client_state *state, bool *flag)
 int
 main(int argc, char *argv[])
 {
-    const char *protocol = "abc";
+    const char *protocol = "libp2p";
     char info_string[256];
     struct client_state state;
     const char *addr_file = "na_test_addr.txt";

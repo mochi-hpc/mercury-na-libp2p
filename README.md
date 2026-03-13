@@ -1,50 +1,71 @@
-# Mercury NA Plugin Template (Rust)
+# Mercury NA Plugin: libp2p
 
-A Rust template for building dynamically-loaded Mercury Network Abstraction
-(NA) plugins. Produces a `libna_plugin_abc.so` that Mercury discovers at
-runtime via `NA_PLUGIN_PATH`, identical in interface to a C plugin but with
-the implementation written in Rust.
+A Mercury Network Abstraction (NA) plugin that uses
+[libp2p](https://libp2p.io/) as the underlying transport. The plugin is
+written in Rust and produces a C-compatible shared library
+(`libna_plugin_libp2p.so`) that Mercury loads at runtime.
+
+## Transport Stack
+
+```
+Application  (Mercury NA API)
+    |
+libp2p-stream  (/mercury-na/1.0.0 protocol)
+    |
+Yamux          (stream multiplexing)
+    |
+Noise          (authenticated encryption)
+    |
+TCP            (OS-assigned port)
+```
+
+Every peer gets a cryptographic identity (Ed25519 key pair) generated
+automatically on initialization. Connections are encrypted and
+multiplexed — multiple logical message streams share a single TCP
+connection per peer pair.
 
 ## Prerequisites
 
-| Tool | Version | Purpose |
-|------|---------|---------|
-| Rust (rustc, cargo) | stable >= 1.77 | Compile the plugin (`c""` literals require 1.77+) |
-| libclang-dev | >= 13 | Required by the `bindgen` crate to parse C headers |
-| CMake | >= 3.15 | Build wrapper and C test suite |
-| Mercury | >= 2.4 | Provides `libna.so`, headers, and cmake config |
+| Dependency | Version | Notes |
+|------------|---------|-------|
+| Rust (rustc, cargo) | stable >= 1.77 | `c""` literals require 1.77+ |
+| libclang-dev | >= 13 | Required by the `bindgen` crate |
+| CMake      | >= 3.15 | Build system |
+| Mercury    | >= 2.4  | NA headers and libraries |
+| pkg-config |         | Locates Mercury if not passed via CMake |
 
-Cargo automatically fetches the `bindgen` and `pkg-config` build-dependencies.
-
-## Project structure
-
-```
-Cargo.toml              # cdylib crate config
-build.rs                # Runs bindgen, emits link flags
-wrapper.h               # Thin #include <na_plugin.h> for bindgen
-src/
-  lib.rs                # Exports na_abc_class_ops_g ops table
-  plugin.rs             # All ~34 extern "C" callback stubs
-CMakeLists.txt          # Finds Mercury, invokes cargo, builds C tests
-test/                   # C test suite (language-agnostic, from Mercury)
-rename-plugin.sh        # Rename "abc" to your plugin name
-```
+Mercury must be installed or its install prefix must be discoverable by
+CMake (`-Dmercury_DIR=...` or via `CMAKE_PREFIX_PATH`).
 
 ## Building
 
-### Option A: Cargo only (plugin .so)
+### CMake (plugin + tests)
 
-If Mercury is installed and discoverable via `pkg-config`:
+```bash
+cd mercury-na-plugin-libp2p
+mkdir -p build && cd build
+cmake .. -Dmercury_DIR=/path/to/mercury/lib/cmake/mercury
+make -j$(nproc)
+```
 
-```sh
+This runs `cargo build --release` under the hood. The shared library is
+placed at:
+
+```
+build/cargo-build/release/libna_plugin_libp2p.so
+```
+
+### Cargo only (plugin .so)
+
+If Mercury is discoverable via `pkg-config`:
+
+```bash
 PKG_CONFIG_PATH=/path/to/mercury/lib/pkgconfig cargo build --release
 ```
 
-The plugin is at `target/release/libna_plugin_abc.so`.
+Or set paths explicitly:
 
-If Mercury is not in `pkg-config`, set the paths explicitly:
-
-```sh
+```bash
 MERCURY_INCLUDE_DIR=/path/to/mercury/include \
 MERCURY_LIB_DIR=/path/to/mercury/lib \
 cargo build --release
@@ -52,87 +73,228 @@ cargo build --release
 
 Multiple include directories can be colon-separated:
 
-```sh
+```bash
 MERCURY_INCLUDE_DIR=/path/to/include:/path/to/extra/headers ...
 ```
 
-### Option B: CMake (plugin + tests)
+### CMake Options
 
-```sh
-mkdir build && cd build
-cmake .. -Dmercury_DIR=/path/to/mercury/share/cmake/mercury
-make -j$(nproc)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `mercury_DIR` | — | Path to Mercury's CMake config |
+| `NA_PLUGIN_INSTALL_DIR` | `<prefix>/lib` | Where `make install` places the `.so` |
+
+## Running the Tests
+
+```bash
+cd build
+NA_PLUGIN_PATH=./cargo-build/release ctest --output-on-failure
 ```
 
-This builds both the Rust plugin (via cargo) and the C test executables.
-The plugin `.so` is placed in `build/cargo-build/release/`.
+Six test suites are included:
 
-## Testing
+| Test | What it covers |
+|------|----------------|
+| `libp2p_init`   | Plugin load, initialize/finalize, protocol info |
+| `libp2p_proc`   | Address serialization round-trip |
+| `libp2p_msg`    | Unexpected and expected message send/recv |
+| `libp2p_lookup` | Address lookup and string conversion |
+| `libp2p_rpc`    | Full Mercury RPC including 16-thread concurrent progress |
+| `libp2p_bulk`   | RMA put/get bulk data transfer |
 
-From the CMake build directory:
+## Using the Plugin
 
-```sh
-LD_LIBRARY_PATH=/path/to/mercury/lib ctest --output-on-failure
+### 1. Set the plugin path
+
+Tell Mercury where to find `libna_plugin_libp2p.so`:
+
+```bash
+export NA_PLUGIN_PATH=/path/to/build/cargo-build/release
 ```
 
-The test suite exercises the plugin through Mercury's public NA API. Since
-the template stubs return `NA_PROTOCOL_ERROR` from `initialize()`, only the
-`abc_proc` test (which does not require initialization) will pass. The
-remaining tests will pass once you implement the callbacks.
+### 2. Initialize
 
-### Expected results for the unmodified template
+```c
+#include <na.h>
 
-| Test | Result | Reason |
-|------|--------|--------|
-| `abc_proc` | Pass | Standalone serialization test, no plugin init needed |
-| `abc_init` | Fail | `initialize()` returns `NA_PROTOCOL_ERROR` |
-| `abc_msg` | Fail | Cannot initialize plugin |
-| `abc_lookup` | Fail | Cannot initialize plugin |
-| `abc_rpc` | Fail | Cannot initialize plugin |
-| `abc_bulk` | Fail | Cannot initialize plugin |
+/* Server — listens on all interfaces, OS-assigned port */
+na_class_t *na_class = NA_Initialize("libp2p+libp2p://", NA_TRUE);
 
-## Renaming the plugin
-
-To rename from "abc" to your own plugin name (e.g. "xyz"):
-
-```sh
-./rename-plugin.sh xyz
+/* Client — ephemeral port on localhost */
+na_class_t *na_class = NA_Initialize("libp2p+libp2p://", NA_FALSE);
 ```
 
-This updates `Cargo.toml`, `CMakeLists.txt`, `src/lib.rs`, `src/plugin.rs`,
-and all test files. The output library becomes `libna_plugin_xyz.so` with
-exported symbol `na_xyz_class_ops_g`.
+The info string format is `libp2p+libp2p://`. The plugin ignores
+everything after the protocol prefix during init; the listen address and
+port are determined automatically (TCP port 0 = OS-assigned).
 
-Remove any old `build/` and `target/` directories before rebuilding.
+### 3. Get the self address
 
-## Implementing your plugin
+After initialization the plugin listens on an OS-assigned TCP port.
+Retrieve the self address to share with peers:
 
-1. **Rename**: `./rename-plugin.sh <name>`
+```c
+na_addr_t self_addr;
+NA_Addr_self(na_class, &self_addr);
 
-2. **Define state structs** in `src/plugin.rs` for your addresses, memory
-   handles, operation IDs, and class-level state.
-
-3. **Implement callbacks** in `src/plugin.rs`. Each function has a doc-comment
-   explaining the expected behaviour and a `// TODO` marker. Key FFI patterns:
-
-   - **Storing Rust state in C structs**: Use `Box::into_raw()` to store a
-     boxed struct in `na_class.plugin_class` during `initialize`, and
-     `Box::from_raw()` to reclaim it during `finalize`.
-
-   - **Completing async operations**: Fill in an `na_cb_completion_data`
-     struct and call `na_cb_completion_add(context, &mut completion_data)`.
-
-   - **Nullable function pointers**: `Some(f)` = non-NULL callback,
-     `None` = NULL (optional callback). Set unused optional callbacks to
-     `None` in the ops table in `lib.rs`.
-
-4. **Run tests**: `cd build && cmake .. && make && ctest`
-
-## Runtime usage
-
-Point Mercury at your plugin directory:
-
-```sh
-NA_PLUGIN_PATH=/path/to/dir/containing/libna_plugin_xyz.so  your_application
+char buf[256];
+na_size_t buf_size = sizeof(buf);
+NA_Addr_to_string(na_class, buf, &buf_size, self_addr);
+/* buf now contains e.g. "libp2p://192.168.1.10:43210/12D3KooW..." */
 ```
 
+### 4. Look up a remote peer
+
+```c
+na_addr_t target_addr;
+NA_Addr_lookup(na_class,
+               "libp2p://192.168.1.20:43211/12D3KooWABC...",
+               &target_addr);
+```
+
+#### Address format
+
+```
+libp2p://IP:PORT/PEERID
+```
+
+`PEERID` is the base58-encoded libp2p peer ID (typically starts with
+`12D3KooW`). The following prefixed forms are also accepted:
+
+```
+libp2p+libp2p://IP:PORT/PEERID   (Mercury canonical form)
+IP:PORT/PEERID                    (bare form)
+```
+
+### 5. Send and receive messages
+
+Standard Mercury NA messaging works as expected:
+
+```c
+/* Sender */
+NA_Msg_send_unexpected(na_class, context, callback, cb_arg,
+                       buf, buf_size, plugin_buf,
+                       target_addr, 0, tag, op_id);
+
+/* Receiver */
+NA_Msg_recv_unexpected(na_class, context, callback, cb_arg,
+                       buf, buf_size, plugin_buf, op_id);
+```
+
+Expected (solicited) messages use `NA_Msg_send_expected` /
+`NA_Msg_recv_expected` with a matching `(peer, tag)` pair.
+
+### 6. RMA (put / get)
+
+Register local memory, serialize the handle, and transfer:
+
+```c
+na_mem_handle_t local_handle;
+NA_Mem_handle_create(na_class, buf, buf_size, flags, &local_handle);
+
+/* Serialize and send the handle to the remote peer out-of-band */
+NA_Mem_handle_serialize(na_class, serial_buf, serial_size, local_handle);
+
+/* Remote side deserializes and issues put/get */
+NA_Put(na_class, context, callback, cb_arg,
+       local_handle, 0, remote_handle, 0, size,
+       remote_addr, 0, op_id);
+```
+
+### 7. Progress loop
+
+Drive completion with the standard Mercury progress pattern:
+
+```c
+unsigned int count;
+NA_Poll(na_class, context, &count);
+NA_Trigger(context, count, &actual);
+```
+
+The plugin exposes an `eventfd` via `NA_Poll_get_fd()` so that the
+application can integrate with `epoll` / `select` instead of
+busy-polling.
+
+## Message Limits
+
+| Parameter | Value |
+|-----------|-------|
+| Max unexpected message size | 64 KB |
+| Max expected message size   | 64 KB |
+| Max tag value               | 2^32 - 1 |
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `NA_PLUGIN_PATH` | Directory containing `libna_plugin_libp2p.so` (required) |
+| `RUST_LOG` | Controls log verbosity. Examples: `error`, `warn`, `debug`, `na_plugin_libp2p=debug` |
+
+## Architecture
+
+```
+Mercury C application
+  |  extern "C" callbacks
+  v
+plugin.rs  (sync, NA thread)
+  |  Command channel (tokio mpsc)
+  v
+runtime.rs (async, Tokio thread)
+  |-- libp2p Swarm event loop
+  |-- Per-peer sender pool (PeerSenderPool)
+  |     \-- One persistent yamux stream per peer direction
+  |-- Incoming stream handler (reads messages in a loop)
+  \-- TCP + Noise + Yamux -> Network
+  |
+  |  Completion channel + eventfd signal
+  v
+plugin.rs  NA_Poll() -> NA_Trigger() -> user callbacks
+```
+
+**Two-thread model:**
+
+- **NA thread** (synchronous) — all `extern "C"` callbacks run here.
+  Sends commands to the async side and drains completions in `NA_Poll`.
+- **Tokio thread** (asynchronous) — runs the libp2p Swarm, handles
+  connection management, and performs all network I/O.
+
+An `eventfd` bridges the two: the async side writes to it when
+completions are ready, and `NA_Poll_get_fd()` returns the fd so Mercury
+can `epoll`/`select` on it.
+
+**Per-peer stream multiplexing:** all outbound messages to a given peer
+are serialized through a single persistent yamux stream (managed by
+`PeerSenderPool`). This avoids the overhead and instability of opening a
+new yamux stream per message under high concurrency.
+
+## Source Layout
+
+```
+src/
+  lib.rs        # FFI ops table (na_libp2p_class_ops_g)
+  plugin.rs     # All 34 NA callback implementations
+  state.rs      # NaLibp2pClass, NaLibp2pAddr, NaLibp2pOpId, NaLibp2pMemHandle
+  runtime.rs    # Tokio runtime, swarm task, per-peer sender pool
+  protocol.rs   # Wire message format (header + payload framing)
+```
+
+## Wire Protocol
+
+Each message on the stream consists of a header followed by a payload:
+
+```
+ 1 byte   msg_type  (1=Unexpected, 2=Expected, 3=RmaPut, 4=RmaGetReq, 5=RmaGetResp)
+ 4 bytes  tag       (big-endian u32)
+ 4 bytes  payload_size (big-endian u32)
+ 2 bytes  peer_id_len  (big-endian u16)
+ N bytes  source peer ID
+ 8 bytes  handle_id    (RMA, big-endian u64)
+ 8 bytes  offset       (RMA, big-endian u64)
+ 8 bytes  rma_length   (RMA, big-endian u64)
+ 8 bytes  local_handle_id  (RMA, big-endian u64)
+ 8 bytes  local_offset     (RMA, big-endian u64)
+ P bytes  payload
+```
+
+Multiple messages are sent back-to-back on the same stream (no
+delimiter needed — the header encodes the payload length).

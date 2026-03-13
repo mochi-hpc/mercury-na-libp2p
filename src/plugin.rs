@@ -1,608 +1,1191 @@
-//! All NA plugin callback stubs for the "abc" plugin.
-//!
-//! Each function corresponds to a field in `struct na_class_ops`.  Required
-//! callbacks return an error (`NA_PROTOCOL_ERROR`) to indicate "not yet
-//! implemented"; optional callbacks that can safely be left `NULL` are set to
-//! `None` in the ops table in `lib.rs`.
-//!
-//! # FFI patterns used in this template
-//!
-//! - **Storing Rust state in C structs**: Use `Box::into_raw()` to convert a
-//!   boxed Rust struct into a `*mut c_void` and store it in
-//!   `na_class.plugin_class` during `initialize`.  Use `Box::from_raw()` to
-//!   reclaim it during `finalize`.
-//!
-//! - **All callbacks are `unsafe extern "C"`** because they are called from C.
-//!
-//! - **`Option<unsafe extern "C" fn(...)>`** maps to nullable function
-//!   pointers: `Some(f)` = non-NULL, `None` = NULL.
+use std::collections::HashMap;
+use std::ffi::{c_void, CStr};
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
-use std::ffi::c_void;
+use libp2p::{Multiaddr, PeerId};
+use parking_lot::Mutex;
+use tracing::error;
 
 use crate::bindings::*;
-use crate::{NA_PROTOCOL_ERROR, NA_SUCCESS, NA_TIMEOUT};
+use crate::protocol::MessageType;
+use crate::runtime::{self, Command};
+use crate::state::*;
+use crate::{NA_CANCELED, NA_INVALID_ARG, NA_NOMEM, NA_OVERFLOW, NA_PROTOCOL_ERROR, NA_SUCCESS, NA_TIMEOUT};
 
-// ------------------------------------------------------------------ //
-//  Protocol discovery                                                  //
-// ------------------------------------------------------------------ //
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
 
-/// Return protocol info entries for protocols this plugin supports.
-///
-/// Called by `NA_Get_protocol_info()`.  Allocate entries with
-/// `na_protocol_info_alloc()` and chain them via the `->next` pointer.
-pub(crate) unsafe extern "C" fn na_abc_get_protocol_info(
+unsafe fn get_class(na_class: *mut na_class_t) -> &'static NaLibp2pClass {
+    &*((*na_class).plugin_class as *const NaLibp2pClass)
+}
+
+// ---------------------------------------------------------------------------
+//  Protocol discovery
+// ---------------------------------------------------------------------------
+
+pub(crate) unsafe extern "C" fn na_libp2p_get_protocol_info(
     _na_info: *const na_info,
     na_protocol_info_p: *mut *mut na_protocol_info,
 ) -> na_return_t {
-    // TODO: Allocate one or more protocol info entries using
-    // na_protocol_info_alloc("abc", "myprotocol", "device0") and chain
-    // them via ->next.  Return the head of the list via *na_protocol_info_p.
-    // If na_info is non-NULL, use it to filter results (e.g. matching a
-    // requested protocol name).
-    unsafe { *na_protocol_info_p = std::ptr::null_mut() };
+    let info = unsafe {
+        na_protocol_info_alloc(
+            c"libp2p".as_ptr(),
+            c"libp2p".as_ptr(),
+            c"tcp0".as_ptr(),
+        )
+    };
+    if info.is_null() {
+        return NA_NOMEM;
+    }
+    unsafe { *na_protocol_info_p = info };
     NA_SUCCESS
 }
 
-/// Return `true` if this plugin can handle the given protocol name.
-///
-/// For example, if your plugin handles `"myprotocol"`, return
-/// `strcmp(protocol_name, "myprotocol") == 0`.
-///
-/// **REQUIRED** -- must not be `None`.
-pub(crate) unsafe extern "C" fn na_abc_check_protocol(
+pub(crate) unsafe extern "C" fn na_libp2p_check_protocol(
     protocol_name: *const std::ffi::c_char,
 ) -> bool {
-    // TODO: Return true if protocol_name matches a protocol this plugin
-    // handles (e.g. "myprotocol").
-    let name = unsafe { std::ffi::CStr::from_ptr(protocol_name) };
-    name == c"myprotocol"
+    let name = unsafe { CStr::from_ptr(protocol_name) };
+    name == c"libp2p"
 }
 
-// ------------------------------------------------------------------ //
-//  Lifecycle                                                           //
-// ------------------------------------------------------------------ //
+// ---------------------------------------------------------------------------
+//  Lifecycle
+// ---------------------------------------------------------------------------
 
-/// Allocate and initialise plugin-private state.
-///
-/// Store it in `na_class.plugin_class` (use `Box::into_raw()` for Rust
-/// state).  Parse connection details from `na_info`.  If `listen` is
-/// `true`, set up to accept incoming connections.
-///
-/// **REQUIRED** -- must not be `None`.
-pub(crate) unsafe extern "C" fn na_abc_initialize(
-    _na_class: *mut na_class_t,
+pub(crate) unsafe extern "C" fn na_libp2p_initialize(
+    na_class: *mut na_class_t,
     _na_info: *const na_info,
-    _listen: bool,
+    listen: bool,
 ) -> na_return_t {
-    // TODO: Allocate plugin-private class state and store in
-    // na_class.plugin_class.  Parse connection info from na_info
-    // (protocol_name, host_name, na_init_info).  If listen is true,
-    // start accepting incoming connections.
-    //
-    // Example (storing Rust state):
-    //   let state = Box::new(MyPluginState::new());
-    //   (*na_class).plugin_class = Box::into_raw(state) as *mut c_void;
-    NA_PROTOCOL_ERROR // not yet implemented
-}
+    // Init tracing (ignore errors if already initialized)
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
 
-/// Tear down plugin-private state that was set up in `initialize()`.
-///
-/// Free `na_class.plugin_class` (use `Box::from_raw()` to reclaim
-/// Rust state).
-///
-/// **REQUIRED** -- must not be `None`.
-pub(crate) unsafe extern "C" fn na_abc_finalize(
-    _na_class: *mut na_class_t,
-) -> na_return_t {
-    // TODO: Shut down transport, release resources, free
-    // na_class.plugin_class.
-    //
-    // Example (reclaiming Rust state):
-    //   let _state = Box::from_raw((*na_class).plugin_class as *mut MyPluginState);
+    // Build tokio runtime
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("Failed to build tokio runtime: {e}");
+            return NA_PROTOCOL_ERROR;
+        }
+    };
+
+    let event_fd = runtime::create_eventfd();
+
+    // Determine listen address
+    let listen_multiaddr: Multiaddr = if listen {
+        "/ip4/0.0.0.0/tcp/0".parse().unwrap()
+    } else {
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap()
+    };
+
+    let queues = Arc::new(Mutex::new(OperationQueues::new()));
+    let mem_handles: Arc<Mutex<HashMap<u64, MemHandleEntry>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    let (cmd_tx, completion_rx, peer_id, listen_ip, listen_port, join_handle) =
+        match runtime::spawn_swarm_task(
+            &rt,
+            listen_multiaddr,
+            queues.clone(),
+            mem_handles.clone(),
+            event_fd,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("Failed to spawn swarm: {e}");
+                runtime::close_eventfd(event_fd);
+                return NA_PROTOCOL_ERROR;
+            }
+        };
+
+    // If listening on 0.0.0.0, resolve to a concrete address
+    let resolved_ip = if listen_ip.is_unspecified() {
+        hostname_ip().unwrap_or(listen_ip)
+    } else {
+        listen_ip
+    };
+
+    let self_addr = Arc::new(NaLibp2pAddr {
+        peer_id,
+        ip: Some(resolved_ip),
+        port: Some(listen_port),
+        is_self: true,
+    });
+
+    // Extract the inner queues from the Arc (the async side also has a clone).
+    // We'll use the Arc directly in NaLibp2pClass instead of unwrapping.
+    let state = Box::new(NaLibp2pClass {
+        self_addr,
+        queues: queues,
+        cmd_tx,
+        completion_rx: Mutex::new(completion_rx),
+        event_fd,
+        runtime: Some(rt),
+        swarm_join: Some(join_handle),
+        mem_handles: mem_handles,
+        next_mem_handle_id: AtomicU64::new(1),
+    });
+
+    unsafe { (*na_class).plugin_class = Box::into_raw(state) as *mut c_void };
     NA_SUCCESS
 }
 
-/// Clean up any global/static resources (temp files, shared memory, etc.)
-/// that would otherwise survive process termination.
-///
-/// Called from `NA_Cleanup()`.  Optional -- may be `None`.
-pub(crate) unsafe extern "C" fn na_abc_cleanup() {
-    // TODO: Remove any global resources (temp files, shared memory segments)
-    // that would persist after the process exits.
+fn hostname_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|a| a.ip())
 }
 
-// ------------------------------------------------------------------ //
-//  Contexts                                                            //
-// ------------------------------------------------------------------ //
+pub(crate) unsafe extern "C" fn na_libp2p_finalize(
+    na_class: *mut na_class_t,
+) -> na_return_t {
+    if (*na_class).plugin_class.is_null() {
+        return NA_SUCCESS;
+    }
+    let mut state = unsafe { Box::from_raw((*na_class).plugin_class as *mut NaLibp2pClass) };
 
-/// Allocate per-context state.  Store it in `*plugin_context_p`.
-///
-/// `id` is a caller-chosen context identifier (e.g. for multi-context).
-pub(crate) unsafe extern "C" fn na_abc_context_create(
+    // Send shutdown
+    let _ = state.cmd_tx.send(Command::Shutdown);
+
+    // Wait for swarm task
+    if let Some(rt) = state.runtime.take() {
+        if let Some(join) = state.swarm_join.take() {
+            let _ = rt.block_on(join);
+        }
+        // Drop runtime
+        drop(rt);
+    }
+
+    runtime::close_eventfd(state.event_fd);
+    drop(state);
+
+    unsafe { (*na_class).plugin_class = std::ptr::null_mut() };
+    NA_SUCCESS
+}
+
+pub(crate) unsafe extern "C" fn na_libp2p_cleanup() {}
+
+// ---------------------------------------------------------------------------
+//  Contexts
+// ---------------------------------------------------------------------------
+
+pub(crate) unsafe extern "C" fn na_libp2p_context_create(
     _na_class: *mut na_class_t,
     _na_context: *mut na_context_t,
     plugin_context_p: *mut *mut c_void,
     _id: u8,
 ) -> na_return_t {
-    // TODO: Allocate per-context state (e.g. completion queues, poll sets)
-    // and return it via *plugin_context_p.  The context id can be used to
-    // bind to specific hardware resources.
     unsafe { *plugin_context_p = std::ptr::null_mut() };
     NA_SUCCESS
 }
 
-/// Free per-context state allocated in `context_create()`.
-pub(crate) unsafe extern "C" fn na_abc_context_destroy(
+pub(crate) unsafe extern "C" fn na_libp2p_context_destroy(
     _na_class: *mut na_class_t,
     _plugin_context: *mut c_void,
 ) -> na_return_t {
-    // TODO: Free per-context state allocated in context_create().
     NA_SUCCESS
 }
 
-// ------------------------------------------------------------------ //
-//  Operation IDs                                                       //
-// ------------------------------------------------------------------ //
+// ---------------------------------------------------------------------------
+//  Operation IDs
+// ---------------------------------------------------------------------------
 
-/// Allocate an operation ID.
-///
-/// `flags` is reserved for future use.  The returned op ID is passed
-/// into send/recv/put/get calls and is used to track and cancel
-/// in-flight operations.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_op_create(
+pub(crate) unsafe extern "C" fn na_libp2p_op_create(
     _na_class: *mut na_class_t,
     _flags: std::ffi::c_ulong,
 ) -> *mut na_op_id_t {
-    // TODO: Allocate and return an operation ID structure.  This is the
-    // handle that tracks an in-flight send/recv/put/get/cancel.
-    std::ptr::null_mut()
+    let op = Box::new(NaLibp2pOpId {
+        completion_data: unsafe { std::mem::zeroed() },
+        context: std::ptr::null_mut(),
+        addr: std::ptr::null_mut(),
+        tag: 0,
+        buf: std::ptr::null_mut(),
+        buf_size: 0,
+        local_handle_id: 0,
+        local_offset: 0,
+        rma_length: 0,
+    });
+    let op_ptr = Box::into_raw(op);
+
+    // Set plugin release callback
+    unsafe {
+        (*op_ptr).completion_data.plugin_callback = Some(na_libp2p_release);
+        (*op_ptr).completion_data.plugin_callback_args = op_ptr as *mut c_void;
+    }
+
+    op_ptr as *mut na_op_id_t
 }
 
-/// Free an operation ID allocated by `op_create()`.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_op_destroy(
+pub(crate) unsafe extern "C" fn na_libp2p_op_destroy(
     _na_class: *mut na_class_t,
-    _op_id: *mut na_op_id_t,
+    op_id: *mut na_op_id_t,
 ) {
-    // TODO: Free the operation ID allocated by op_create().
+    if !op_id.is_null() {
+        let _ = unsafe { Box::from_raw(op_id as *mut NaLibp2pOpId) };
+    }
 }
 
-// ------------------------------------------------------------------ //
-//  Addressing                                                          //
-// ------------------------------------------------------------------ //
+// ---------------------------------------------------------------------------
+//  Addressing
+// ---------------------------------------------------------------------------
 
-/// Resolve a peer address from a string name (e.g. `"host:port"`).
-///
-/// Allocate an `na_addr_t` and return it via `*addr_p`.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_addr_lookup(
-    _na_class: *mut na_class_t,
-    _name: *const std::ffi::c_char,
-    _addr_p: *mut *mut na_addr_t,
+pub(crate) unsafe extern "C" fn na_libp2p_addr_lookup(
+    na_class: *mut na_class_t,
+    name: *const std::ffi::c_char,
+    addr_p: *mut *mut na_addr_t,
 ) -> na_return_t {
-    // TODO: Resolve a string address (e.g. "host:port") to an internal
-    // address structure.  Allocate and return via *addr_p.
-    NA_PROTOCOL_ERROR
+    let cls = unsafe { get_class(na_class) };
+    let name_str = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+
+    tracing::debug!("addr_lookup: raw input='{}'", name_str);
+
+    // Strip various prefixes Mercury might add:
+    // "libp2p+libp2p://...", "libp2p://...", or just "ip:port/peerid"
+    let input = name_str
+        .strip_prefix("libp2p+libp2p://")
+        .or_else(|| name_str.strip_prefix("libp2p://"))
+        .unwrap_or(&name_str);
+
+    // Parse ip:port/peerid
+    let slash_pos = match input.rfind('/') {
+        Some(p) => p,
+        None => {
+            error!("addr_lookup: no slash in '{input}'");
+            return NA_PROTOCOL_ERROR;
+        }
+    };
+    let addr_part = &input[..slash_pos];
+    let peer_id_str = &input[slash_pos + 1..];
+
+    let peer_id = match peer_id_str.parse::<PeerId>() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("addr_lookup: bad peer_id '{peer_id_str}': {e}");
+            return NA_PROTOCOL_ERROR;
+        }
+    };
+
+    // Parse ip:port
+    let colon_pos = match addr_part.rfind(':') {
+        Some(p) => p,
+        None => {
+            error!("addr_lookup: no colon in addr_part '{addr_part}'");
+            return NA_PROTOCOL_ERROR;
+        }
+    };
+    let ip_str = &addr_part[..colon_pos];
+    let port_str = &addr_part[colon_pos + 1..];
+
+    let ip: std::net::IpAddr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(e) => {
+            error!("addr_lookup: bad ip '{ip_str}': {e}");
+            return NA_PROTOCOL_ERROR;
+        }
+    };
+    let port: u16 = match port_str.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("addr_lookup: bad port '{port_str}': {e}");
+            return NA_PROTOCOL_ERROR;
+        }
+    };
+
+    // Build multiaddr and tell swarm about it
+    let multiaddr: Multiaddr = match ip {
+        std::net::IpAddr::V4(v4) => format!("/ip4/{}/tcp/{}", v4, port),
+        std::net::IpAddr::V6(v6) => format!("/ip6/{}/tcp/{}", v6, port),
+    }
+    .parse()
+    .unwrap();
+
+    tracing::debug!("addr_lookup: input={input}, peer_id={peer_id}, multiaddr={multiaddr}");
+    let _ = cls.cmd_tx.send(Command::AddKnownAddr {
+        peer_id,
+        multiaddr,
+    });
+
+    let addr = NaLibp2pAddr::alloc_boxed(peer_id, Some(ip), Some(port), false);
+    unsafe { *addr_p = addr as *mut na_addr_t };
+    NA_SUCCESS
 }
 
-/// Free an address returned by `addr_lookup`, `addr_self`, `addr_dup`, or
-/// `addr_deserialize`.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_addr_free(
+pub(crate) unsafe extern "C" fn na_libp2p_addr_free(
     _na_class: *mut na_class_t,
-    _addr: *mut na_addr_t,
+    addr: *mut na_addr_t,
 ) {
-    // TODO: Free an address allocated by addr_lookup/addr_self/addr_dup/
-    // addr_deserialize.
+    if !addr.is_null() {
+        let _ = unsafe { Box::from_raw(addr as *mut NaLibp2pAddr) };
+    }
 }
 
-/// Return the address of this process/endpoint via `*addr_p`.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_addr_self(
-    _na_class: *mut na_class_t,
-    _addr_p: *mut *mut na_addr_t,
+pub(crate) unsafe extern "C" fn na_libp2p_addr_self(
+    na_class: *mut na_class_t,
+    addr_p: *mut *mut na_addr_t,
 ) -> na_return_t {
-    // TODO: Allocate and return the local endpoint address.
-    NA_PROTOCOL_ERROR
+    let cls = unsafe { get_class(na_class) };
+    let dup = NaLibp2pAddr::dup(&cls.self_addr);
+    unsafe { *addr_p = dup as *mut na_addr_t };
+    NA_SUCCESS
 }
 
-/// Duplicate an address (deep copy).
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_addr_dup(
+pub(crate) unsafe extern "C" fn na_libp2p_addr_dup(
     _na_class: *mut na_class_t,
-    _addr: *mut na_addr_t,
-    _new_addr_p: *mut *mut na_addr_t,
+    addr: *mut na_addr_t,
+    new_addr_p: *mut *mut na_addr_t,
 ) -> na_return_t {
-    // TODO: Deep-copy addr into a newly allocated address.
-    NA_PROTOCOL_ERROR
+    if addr.is_null() {
+        return NA_INVALID_ARG;
+    }
+    let src = unsafe { &*(addr as *const NaLibp2pAddr) };
+    let dup = NaLibp2pAddr::dup(src);
+    unsafe { *new_addr_p = dup as *mut na_addr_t };
+    NA_SUCCESS
 }
 
-/// Return `true` if `addr1` and `addr2` refer to the same endpoint.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_addr_cmp(
+pub(crate) unsafe extern "C" fn na_libp2p_addr_cmp(
     _na_class: *mut na_class_t,
-    _addr1: *mut na_addr_t,
-    _addr2: *mut na_addr_t,
+    addr1: *mut na_addr_t,
+    addr2: *mut na_addr_t,
 ) -> bool {
-    // TODO: Return true if addr1 and addr2 point to the same endpoint.
-    false
+    if addr1 == addr2 {
+        return true;
+    }
+    if addr1.is_null() || addr2.is_null() {
+        return false;
+    }
+    let a1 = unsafe { &*(addr1 as *const NaLibp2pAddr) };
+    let a2 = unsafe { &*(addr2 as *const NaLibp2pAddr) };
+    a1.peer_id == a2.peer_id
 }
 
-/// Return `true` if `addr` is the local (self) address.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_addr_is_self(
-    _na_class: *mut na_class_t,
-    _addr: *mut na_addr_t,
+pub(crate) unsafe extern "C" fn na_libp2p_addr_is_self(
+    na_class: *mut na_class_t,
+    addr: *mut na_addr_t,
 ) -> bool {
-    // TODO: Return true if addr is the local address.
-    false
+    if addr.is_null() {
+        return false;
+    }
+    let cls = unsafe { get_class(na_class) };
+    let a = unsafe { &*(addr as *const NaLibp2pAddr) };
+    a.peer_id == cls.self_addr.peer_id
 }
 
-/// Convert an address to a human-readable string.
-///
-/// Write at most `*buf_size` bytes into `buf` and update `*buf_size`
-/// to the total size needed (including the terminating NUL).  If `buf`
-/// is NULL, just return the required size.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_addr_to_string(
+pub(crate) unsafe extern "C" fn na_libp2p_addr_to_string(
     _na_class: *mut na_class_t,
-    _buf: *mut std::ffi::c_char,
-    _buf_size: *mut usize,
-    _addr: *mut na_addr_t,
+    buf: *mut std::ffi::c_char,
+    buf_size: *mut usize,
+    addr: *mut na_addr_t,
 ) -> na_return_t {
-    // TODO: Write a human-readable representation of addr into buf.
-    // Update *buf_size to the total bytes needed (including NUL).
-    // If buf is NULL, just report the required size.
-    NA_PROTOCOL_ERROR
+    if addr.is_null() || buf_size.is_null() {
+        return NA_INVALID_ARG;
+    }
+    let a = unsafe { &*(addr as *const NaLibp2pAddr) };
+    let s = a.to_addr_string();
+    let needed = s.len() + 1;
+
+    if buf.is_null() {
+        unsafe { *buf_size = needed };
+        return NA_SUCCESS;
+    }
+
+    if unsafe { *buf_size } < needed {
+        unsafe { *buf_size = needed };
+        return NA_OVERFLOW;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(s.as_ptr(), buf as *mut u8, s.len());
+        *(buf.add(s.len())) = 0;
+        *buf_size = needed;
+    }
+    NA_SUCCESS
 }
 
-/// Return the number of bytes needed to serialise `addr`.
-pub(crate) unsafe extern "C" fn na_abc_addr_get_serialize_size(
+pub(crate) unsafe extern "C" fn na_libp2p_addr_get_serialize_size(
     _na_class: *mut na_class_t,
-    _addr: *mut na_addr_t,
+    addr: *mut na_addr_t,
 ) -> usize {
-    // TODO: Return the number of bytes needed to serialize addr.
-    0
+    if addr.is_null() {
+        return 0;
+    }
+    let a = unsafe { &*(addr as *const NaLibp2pAddr) };
+    let peer_bytes = a.peer_id.to_bytes();
+    // [2B peer_id_len][peer_id_bytes][1B has_addr][optional: 1B ip_ver + ip_bytes + 2B port]
+    let mut size = 2 + peer_bytes.len() + 1;
+    if a.ip.is_some() && a.port.is_some() {
+        size += 1; // ip version marker
+        size += match a.ip.unwrap() {
+            std::net::IpAddr::V4(_) => 4,
+            std::net::IpAddr::V6(_) => 16,
+        };
+        size += 2; // port
+    }
+    size
 }
 
-/// Serialise `addr` into `buf` (`buf_size` bytes available).
-pub(crate) unsafe extern "C" fn na_abc_addr_serialize(
+pub(crate) unsafe extern "C" fn na_libp2p_addr_serialize(
     _na_class: *mut na_class_t,
-    _buf: *mut c_void,
-    _buf_size: usize,
-    _addr: *mut na_addr_t,
+    buf: *mut c_void,
+    buf_size: usize,
+    addr: *mut na_addr_t,
 ) -> na_return_t {
-    // TODO: Serialize addr into buf (buf_size bytes available).
-    NA_PROTOCOL_ERROR
+    if addr.is_null() || buf.is_null() {
+        return NA_INVALID_ARG;
+    }
+    let a = unsafe { &*(addr as *const NaLibp2pAddr) };
+    let peer_bytes = a.peer_id.to_bytes();
+
+    let out = buf as *mut u8;
+    let mut pos = 0usize;
+
+    macro_rules! write_bytes {
+        ($data:expr) => {
+            let d: &[u8] = $data;
+            if pos + d.len() > buf_size {
+                return NA_OVERFLOW;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(d.as_ptr(), out.add(pos), d.len()) };
+            pos += d.len();
+        };
+    }
+
+    write_bytes!(&(peer_bytes.len() as u16).to_be_bytes());
+    write_bytes!(&peer_bytes);
+
+    if let (Some(ip), Some(port)) = (a.ip, a.port) {
+        write_bytes!(&[1u8]);
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                write_bytes!(&[4u8]);
+                write_bytes!(&v4.octets());
+            }
+            std::net::IpAddr::V6(v6) => {
+                write_bytes!(&[6u8]);
+                write_bytes!(&v6.octets());
+            }
+        }
+        write_bytes!(&port.to_be_bytes());
+    } else {
+        write_bytes!(&[0u8]);
+    }
+
+    NA_SUCCESS
 }
 
-/// Deserialise an address from `buf` into `*addr_p`.
-pub(crate) unsafe extern "C" fn na_abc_addr_deserialize(
+pub(crate) unsafe extern "C" fn na_libp2p_addr_deserialize(
     _na_class: *mut na_class_t,
-    _addr_p: *mut *mut na_addr_t,
-    _buf: *const c_void,
-    _buf_size: usize,
+    addr_p: *mut *mut na_addr_t,
+    buf: *const c_void,
+    buf_size: usize,
     _flags: u64,
 ) -> na_return_t {
-    // TODO: Reconstruct an address from buf and return via *addr_p.
-    NA_PROTOCOL_ERROR
+    if buf.is_null() || addr_p.is_null() || buf_size < 3 {
+        return NA_INVALID_ARG;
+    }
+
+    let data = unsafe { std::slice::from_raw_parts(buf as *const u8, buf_size) };
+    let mut pos = 0;
+
+    if pos + 2 > data.len() {
+        return NA_PROTOCOL_ERROR;
+    }
+    let peer_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    if pos + peer_id_len > data.len() {
+        return NA_PROTOCOL_ERROR;
+    }
+    let peer_id = match PeerId::from_bytes(&data[pos..pos + peer_id_len]) {
+        Ok(p) => p,
+        Err(_) => return NA_PROTOCOL_ERROR,
+    };
+    pos += peer_id_len;
+
+    if pos >= data.len() {
+        return NA_PROTOCOL_ERROR;
+    }
+    let has_addr = data[pos];
+    pos += 1;
+
+    let (ip, port) = if has_addr != 0 {
+        if pos >= data.len() {
+            return NA_PROTOCOL_ERROR;
+        }
+        let ip_ver = data[pos];
+        pos += 1;
+
+        let ip: std::net::IpAddr = match ip_ver {
+            4 => {
+                if pos + 4 > data.len() {
+                    return NA_PROTOCOL_ERROR;
+                }
+                let octets: [u8; 4] = data[pos..pos + 4].try_into().unwrap();
+                pos += 4;
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets))
+            }
+            6 => {
+                if pos + 16 > data.len() {
+                    return NA_PROTOCOL_ERROR;
+                }
+                let octets: [u8; 16] = data[pos..pos + 16].try_into().unwrap();
+                pos += 16;
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
+            }
+            _ => return NA_PROTOCOL_ERROR,
+        };
+
+        if pos + 2 > data.len() {
+            return NA_PROTOCOL_ERROR;
+        }
+        let port = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        (Some(ip), Some(port))
+    } else {
+        (None, None)
+    };
+
+    let addr = NaLibp2pAddr::alloc_boxed(peer_id, ip, port, false);
+    unsafe { *addr_p = addr as *mut na_addr_t };
+    NA_SUCCESS
 }
 
-// ------------------------------------------------------------------ //
-//  Message sizes & tags                                                //
-// ------------------------------------------------------------------ //
+// ---------------------------------------------------------------------------
+//  Message sizes & tags
+// ---------------------------------------------------------------------------
 
-/// Return the maximum payload size for unexpected (unmatched) messages.
-pub(crate) unsafe extern "C" fn na_abc_msg_get_max_unexpected_size(
+pub(crate) unsafe extern "C" fn na_libp2p_msg_get_max_unexpected_size(
     _na_class: *const na_class_t,
 ) -> usize {
-    // TODO: Return the maximum payload size for an unexpected message.
-    // This should reflect transport limits.
-    0
+    MAX_MSG_SIZE
 }
 
-/// Return the maximum payload size for expected (matched) messages.
-pub(crate) unsafe extern "C" fn na_abc_msg_get_max_expected_size(
+pub(crate) unsafe extern "C" fn na_libp2p_msg_get_max_expected_size(
     _na_class: *const na_class_t,
 ) -> usize {
-    // TODO: Return the maximum payload size for an expected message.
-    0
+    MAX_MSG_SIZE
 }
 
-/// Return the maximum tag value this plugin supports.
-pub(crate) unsafe extern "C" fn na_abc_msg_get_max_tag(
+pub(crate) unsafe extern "C" fn na_libp2p_msg_get_max_tag(
     _na_class: *const na_class_t,
 ) -> na_tag_t {
-    // TODO: Return the largest tag value that can be used for matching.
-    // Tags are unsigned integers; typical transports support at least 2^30.
-    0
+    u32::MAX
 }
 
-// ------------------------------------------------------------------ //
-//  Unexpected messages                                                 //
-// ------------------------------------------------------------------ //
+// ---------------------------------------------------------------------------
+//  Unexpected messages
+// ---------------------------------------------------------------------------
 
-/// Post a non-blocking unexpected (unmatched) send.
-///
-/// When the operation completes, fill in an `na_cb_completion_data` and
-/// call `na_cb_completion_add(context, &completion_data)` so that
-/// `NA_Trigger()` can invoke `callback(arg)`.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_msg_send_unexpected(
-    _na_class: *mut na_class_t,
-    _context: *mut na_context_t,
-    _callback: na_cb_t,
-    _arg: *mut c_void,
-    _buf: *const c_void,
-    _buf_size: usize,
+pub(crate) unsafe extern "C" fn na_libp2p_msg_send_unexpected(
+    na_class: *mut na_class_t,
+    context: *mut na_context_t,
+    callback: na_cb_t,
+    arg: *mut c_void,
+    buf: *const c_void,
+    buf_size: usize,
     _plugin_data: *mut c_void,
-    _dest_addr: *mut na_addr_t,
+    dest_addr: *mut na_addr_t,
     _dest_id: u8,
-    _tag: na_tag_t,
-    _op_id: *mut na_op_id_t,
+    tag: na_tag_t,
+    op_id: *mut na_op_id_t,
 ) -> na_return_t {
-    // TODO: Initiate a non-blocking unexpected send to dest_addr.
-    // When complete, fill in an na_cb_completion_data and call
-    // na_cb_completion_add(context, &completion_data).
-    NA_PROTOCOL_ERROR
+    let cls = unsafe { get_class(na_class) };
+    let dest = unsafe { &*(dest_addr as *const NaLibp2pAddr) };
+    let op = unsafe { &mut *(op_id as *mut NaLibp2pOpId) };
+
+    op.completion_data.callback = callback;
+    op.completion_data.callback_info.arg = arg;
+    op.completion_data.callback_info.type_ = na_cb_type_NA_CB_SEND_UNEXPECTED;
+    op.context = context;
+    op.tag = tag;
+
+    let payload = if buf_size > 0 && !buf.is_null() {
+        unsafe { std::slice::from_raw_parts(buf as *const u8, buf_size).to_vec() }
+    } else {
+        Vec::new()
+    };
+
+    let _ = cls.cmd_tx.send(Command::SendMessage {
+        dest_peer_id: dest.peer_id,
+        msg_type: MessageType::Unexpected,
+        tag,
+        payload,
+        op_ptr: op_id as usize,
+        source_peer_id: cls.self_addr.peer_id,
+    });
+
+    NA_SUCCESS
 }
 
-/// Post a non-blocking unexpected receive.
-///
-/// When a matching message arrives, complete the operation via
-/// `na_cb_completion_add()`.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_msg_recv_unexpected(
-    _na_class: *mut na_class_t,
-    _context: *mut na_context_t,
-    _callback: na_cb_t,
-    _arg: *mut c_void,
-    _buf: *mut c_void,
-    _buf_size: usize,
+pub(crate) unsafe extern "C" fn na_libp2p_msg_recv_unexpected(
+    na_class: *mut na_class_t,
+    context: *mut na_context_t,
+    callback: na_cb_t,
+    arg: *mut c_void,
+    buf: *mut c_void,
+    buf_size: usize,
     _plugin_data: *mut c_void,
-    _op_id: *mut na_op_id_t,
+    op_id: *mut na_op_id_t,
 ) -> na_return_t {
-    // TODO: Post a non-blocking unexpected receive.  When a message
-    // arrives, complete the operation via na_cb_completion_add().
-    NA_PROTOCOL_ERROR
+    let cls = unsafe { get_class(na_class) };
+    let op = unsafe { &mut *(op_id as *mut NaLibp2pOpId) };
+
+    op.completion_data.callback = callback;
+    op.completion_data.callback_info.arg = arg;
+    op.completion_data.callback_info.type_ = na_cb_type_NA_CB_RECV_UNEXPECTED;
+    op.context = context;
+    op.buf = buf;
+    op.buf_size = buf_size;
+    op.addr = std::ptr::null_mut();
+
+    let mut queues = cls.queues.lock();
+
+    // Check stash first
+    if let Some(stashed) = queues.unexpected_msg_stash.pop_front() {
+        let copy_size = stashed.payload.len().min(buf_size);
+        if copy_size > 0 && !buf.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(stashed.payload.as_ptr(), buf as *mut u8, copy_size);
+            }
+        }
+
+        op.completion_data.callback_info.info.recv_unexpected =
+            na_cb_info_recv_unexpected {
+                actual_buf_size: stashed.payload.len(),
+                source: stashed.source_addr as *mut na_addr_t,
+                tag: stashed.tag,
+            };
+        op.completion_data.callback_info.ret = NA_SUCCESS;
+
+        unsafe { na_cb_completion_add(context, &mut op.completion_data) };
+        return NA_SUCCESS;
+    }
+
+    // No stashed message — enqueue the op
+    queues
+        .unexpected_recv_ops
+        .push_back(op_id as *mut NaLibp2pOpId);
+    NA_SUCCESS
 }
 
-// ------------------------------------------------------------------ //
-//  Expected messages                                                   //
-// ------------------------------------------------------------------ //
+// ---------------------------------------------------------------------------
+//  Expected messages
+// ---------------------------------------------------------------------------
 
-/// Post a non-blocking expected (matched) send.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_msg_send_expected(
-    _na_class: *mut na_class_t,
-    _context: *mut na_context_t,
-    _callback: na_cb_t,
-    _arg: *mut c_void,
-    _buf: *const c_void,
-    _buf_size: usize,
+pub(crate) unsafe extern "C" fn na_libp2p_msg_send_expected(
+    na_class: *mut na_class_t,
+    context: *mut na_context_t,
+    callback: na_cb_t,
+    arg: *mut c_void,
+    buf: *const c_void,
+    buf_size: usize,
     _plugin_data: *mut c_void,
-    _dest_addr: *mut na_addr_t,
+    dest_addr: *mut na_addr_t,
     _dest_id: u8,
-    _tag: na_tag_t,
-    _op_id: *mut na_op_id_t,
+    tag: na_tag_t,
+    op_id: *mut na_op_id_t,
 ) -> na_return_t {
-    // TODO: Initiate a non-blocking expected send.
-    NA_PROTOCOL_ERROR
+    let cls = unsafe { get_class(na_class) };
+    let dest = unsafe { &*(dest_addr as *const NaLibp2pAddr) };
+    let op = unsafe { &mut *(op_id as *mut NaLibp2pOpId) };
+
+    op.completion_data.callback = callback;
+    op.completion_data.callback_info.arg = arg;
+    op.completion_data.callback_info.type_ = na_cb_type_NA_CB_SEND_EXPECTED;
+    op.context = context;
+    op.tag = tag;
+
+    let payload = if buf_size > 0 && !buf.is_null() {
+        unsafe { std::slice::from_raw_parts(buf as *const u8, buf_size).to_vec() }
+    } else {
+        Vec::new()
+    };
+
+    let _ = cls.cmd_tx.send(Command::SendMessage {
+        dest_peer_id: dest.peer_id,
+        msg_type: MessageType::Expected,
+        tag,
+        payload,
+        op_ptr: op_id as usize,
+        source_peer_id: cls.self_addr.peer_id,
+    });
+
+    NA_SUCCESS
 }
 
-/// Post a non-blocking expected receive.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_msg_recv_expected(
-    _na_class: *mut na_class_t,
-    _context: *mut na_context_t,
-    _callback: na_cb_t,
-    _arg: *mut c_void,
-    _buf: *mut c_void,
-    _buf_size: usize,
+pub(crate) unsafe extern "C" fn na_libp2p_msg_recv_expected(
+    na_class: *mut na_class_t,
+    context: *mut na_context_t,
+    callback: na_cb_t,
+    arg: *mut c_void,
+    buf: *mut c_void,
+    buf_size: usize,
     _plugin_data: *mut c_void,
-    _source_addr: *mut na_addr_t,
+    source_addr: *mut na_addr_t,
     _source_id: u8,
-    _tag: na_tag_t,
-    _op_id: *mut na_op_id_t,
+    tag: na_tag_t,
+    op_id: *mut na_op_id_t,
 ) -> na_return_t {
-    // TODO: Post a non-blocking expected receive.
-    NA_PROTOCOL_ERROR
+    let cls = unsafe { get_class(na_class) };
+    let op = unsafe { &mut *(op_id as *mut NaLibp2pOpId) };
+
+    op.completion_data.callback = callback;
+    op.completion_data.callback_info.arg = arg;
+    op.completion_data.callback_info.type_ = na_cb_type_NA_CB_RECV_EXPECTED;
+    op.context = context;
+    op.buf = buf;
+    op.buf_size = buf_size;
+    op.tag = tag;
+    op.addr = if source_addr.is_null() {
+        std::ptr::null_mut()
+    } else {
+        source_addr as *mut NaLibp2pAddr
+    };
+
+    let mut queues = cls.queues.lock();
+
+    let source_peer_id = if !source_addr.is_null() {
+        Some(unsafe { (*(source_addr as *const NaLibp2pAddr)).peer_id })
+    } else {
+        None
+    };
+
+    let matched_idx = queues.expected_msg_stash.iter().position(|msg| {
+        let tag_match = msg.tag == tag;
+        let addr_match = match source_peer_id {
+            Some(pid) => {
+                if msg.source_addr.is_null() {
+                    true
+                } else {
+                    unsafe { (*msg.source_addr).peer_id == pid }
+                }
+            }
+            None => true,
+        };
+        tag_match && addr_match
+    });
+
+    if let Some(idx) = matched_idx {
+        let stashed = queues.expected_msg_stash.remove(idx).unwrap();
+        let copy_size = stashed.payload.len().min(buf_size);
+        if copy_size > 0 && !buf.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    stashed.payload.as_ptr(),
+                    buf as *mut u8,
+                    copy_size,
+                );
+            }
+        }
+
+        // Free the stashed source addr
+        if !stashed.source_addr.is_null() {
+            let _ = unsafe { Box::from_raw(stashed.source_addr) };
+        }
+
+        op.completion_data.callback_info.info.recv_expected =
+            na_cb_info_recv_expected {
+                actual_buf_size: stashed.payload.len(),
+            };
+        op.completion_data.callback_info.ret = NA_SUCCESS;
+
+        unsafe { na_cb_completion_add(context, &mut op.completion_data) };
+        return NA_SUCCESS;
+    }
+
+    queues
+        .expected_recv_ops
+        .push_back(op_id as *mut NaLibp2pOpId);
+    NA_SUCCESS
 }
 
-// ------------------------------------------------------------------ //
-//  Memory handles                                                      //
-// ------------------------------------------------------------------ //
+// ---------------------------------------------------------------------------
+//  Memory handles
+// ---------------------------------------------------------------------------
 
-/// Create a memory handle that describes a contiguous region for RMA.
-///
-/// `flags` is a bitmask of `NA_MEM_READ_ONLY` / `NA_MEM_WRITE_ONLY` /
-/// `NA_MEM_READWRITE`.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_mem_handle_create(
-    _na_class: *mut na_class_t,
-    _buf: *mut c_void,
-    _buf_size: usize,
-    _flags: std::ffi::c_ulong,
-    _mem_handle_p: *mut *mut na_mem_handle_t,
+pub(crate) unsafe extern "C" fn na_libp2p_mem_handle_create(
+    na_class: *mut na_class_t,
+    buf: *mut c_void,
+    buf_size: usize,
+    flags: std::ffi::c_ulong,
+    mem_handle_p: *mut *mut na_mem_handle_t,
 ) -> na_return_t {
-    // TODO: Create a memory handle describing a contiguous buffer for RMA.
-    // flags indicates access mode (NA_MEM_READ_ONLY, etc.).
-    NA_PROTOCOL_ERROR
+    let cls = unsafe { get_class(na_class) };
+    let handle_id = cls.next_handle_id();
+
+    let handle = Box::new(NaLibp2pMemHandle {
+        buf,
+        buf_size,
+        handle_id,
+        flags: flags as u64,
+        owner_peer_id: None,
+    });
+
+    // Register in shared registry
+    cls.mem_handles.lock().insert(
+        handle_id,
+        MemHandleEntry {
+            buf,
+            buf_size,
+            flags: flags as u64,
+        },
+    );
+
+    unsafe { *mem_handle_p = Box::into_raw(handle) as *mut na_mem_handle_t };
+    NA_SUCCESS
 }
 
-/// Free a memory handle.
-pub(crate) unsafe extern "C" fn na_abc_mem_handle_free(
-    _na_class: *mut na_class_t,
-    _mem_handle: *mut na_mem_handle_t,
+pub(crate) unsafe extern "C" fn na_libp2p_mem_handle_free(
+    na_class: *mut na_class_t,
+    mem_handle: *mut na_mem_handle_t,
 ) {
-    // TODO: Free a memory handle created by mem_handle_create.
+    if mem_handle.is_null() {
+        return;
+    }
+    let handle = unsafe { Box::from_raw(mem_handle as *mut NaLibp2pMemHandle) };
+    if handle.owner_peer_id.is_none() {
+        let cls = unsafe { get_class(na_class) };
+        cls.mem_handles.lock().remove(&handle.handle_id);
+    }
 }
 
-/// Return the serialised size of a memory handle.
-pub(crate) unsafe extern "C" fn na_abc_mem_handle_get_serialize_size(
-    _na_class: *mut na_class_t,
-    _mem_handle: *mut na_mem_handle_t,
+pub(crate) unsafe extern "C" fn na_libp2p_mem_handle_get_serialize_size(
+    na_class: *mut na_class_t,
+    mem_handle: *mut na_mem_handle_t,
 ) -> usize {
-    // TODO: Return the number of bytes needed to serialize the handle.
-    0
+    if mem_handle.is_null() {
+        return 0;
+    }
+    let handle = unsafe { &*(mem_handle as *const NaLibp2pMemHandle) };
+    let cls = unsafe { get_class(na_class) };
+    let peer_id = handle
+        .owner_peer_id
+        .unwrap_or(cls.self_addr.peer_id);
+    let peer_bytes_len = peer_id.to_bytes().len();
+    // [8B handle_id][8B buf_size][8B flags][2B peer_id_len][peer_id_bytes]
+    8 + 8 + 8 + 2 + peer_bytes_len
 }
 
-/// Serialise a memory handle into `buf`.
-pub(crate) unsafe extern "C" fn na_abc_mem_handle_serialize(
-    _na_class: *mut na_class_t,
-    _buf: *mut c_void,
-    _buf_size: usize,
-    _mem_handle: *mut na_mem_handle_t,
+pub(crate) unsafe extern "C" fn na_libp2p_mem_handle_serialize(
+    na_class: *mut na_class_t,
+    buf: *mut c_void,
+    buf_size: usize,
+    mem_handle: *mut na_mem_handle_t,
 ) -> na_return_t {
-    // TODO: Serialize the memory handle into buf so it can be sent to
-    // a remote peer for RMA.
-    NA_PROTOCOL_ERROR
+    if buf.is_null() || mem_handle.is_null() {
+        return NA_INVALID_ARG;
+    }
+    let handle = unsafe { &*(mem_handle as *const NaLibp2pMemHandle) };
+    let cls = unsafe { get_class(na_class) };
+
+    let out = buf as *mut u8;
+    let mut pos = 0usize;
+
+    macro_rules! write_bytes {
+        ($data:expr) => {
+            let d: &[u8] = $data;
+            if pos + d.len() > buf_size {
+                return NA_OVERFLOW;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(d.as_ptr(), out.add(pos), d.len()) };
+            pos += d.len();
+        };
+    }
+
+    write_bytes!(&handle.handle_id.to_be_bytes());
+    write_bytes!(&(handle.buf_size as u64).to_be_bytes());
+    write_bytes!(&handle.flags.to_be_bytes());
+
+    let peer_id = handle
+        .owner_peer_id
+        .unwrap_or(cls.self_addr.peer_id);
+    let peer_bytes = peer_id.to_bytes();
+    write_bytes!(&(peer_bytes.len() as u16).to_be_bytes());
+    write_bytes!(&peer_bytes);
+
+    NA_SUCCESS
 }
 
-/// Deserialise a memory handle from `buf`.
-pub(crate) unsafe extern "C" fn na_abc_mem_handle_deserialize(
+pub(crate) unsafe extern "C" fn na_libp2p_mem_handle_deserialize(
     _na_class: *mut na_class_t,
-    _mem_handle_p: *mut *mut na_mem_handle_t,
-    _buf: *const c_void,
-    _buf_size: usize,
+    mem_handle_p: *mut *mut na_mem_handle_t,
+    buf: *const c_void,
+    buf_size: usize,
 ) -> na_return_t {
-    // TODO: Reconstruct a remote memory handle from buf.
-    NA_PROTOCOL_ERROR
+    if buf.is_null() || mem_handle_p.is_null() || buf_size < 26 {
+        return NA_INVALID_ARG;
+    }
+    let data = unsafe { std::slice::from_raw_parts(buf as *const u8, buf_size) };
+    let mut pos = 0;
+
+    let handle_id = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+    let remote_buf_size = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+    pos += 8;
+    let flags = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    if pos + 2 > data.len() {
+        return NA_PROTOCOL_ERROR;
+    }
+    let peer_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    if pos + peer_id_len > data.len() {
+        return NA_PROTOCOL_ERROR;
+    }
+    let peer_id = match PeerId::from_bytes(&data[pos..pos + peer_id_len]) {
+        Ok(p) => p,
+        Err(_) => return NA_PROTOCOL_ERROR,
+    };
+
+    let handle = Box::new(NaLibp2pMemHandle {
+        buf: std::ptr::null_mut(),
+        buf_size: remote_buf_size,
+        handle_id,
+        flags,
+        owner_peer_id: Some(peer_id),
+    });
+
+    unsafe { *mem_handle_p = Box::into_raw(handle) as *mut na_mem_handle_t };
+    NA_SUCCESS
 }
 
-// ------------------------------------------------------------------ //
-//  RMA (put / get)                                                     //
-// ------------------------------------------------------------------ //
+// ---------------------------------------------------------------------------
+//  RMA
+// ---------------------------------------------------------------------------
 
-/// Initiate a non-blocking RMA put (write to remote memory).
-///
-/// **REQUIRED** for RMA support.
-pub(crate) unsafe extern "C" fn na_abc_put(
-    _na_class: *mut na_class_t,
-    _context: *mut na_context_t,
-    _callback: na_cb_t,
-    _arg: *mut c_void,
-    _local_mem_handle: *mut na_mem_handle_t,
-    _local_offset: na_offset_t,
-    _remote_mem_handle: *mut na_mem_handle_t,
-    _remote_offset: na_offset_t,
-    _length: usize,
-    _remote_addr: *mut na_addr_t,
+pub(crate) unsafe extern "C" fn na_libp2p_put(
+    na_class: *mut na_class_t,
+    context: *mut na_context_t,
+    callback: na_cb_t,
+    arg: *mut c_void,
+    local_mem_handle: *mut na_mem_handle_t,
+    local_offset: na_offset_t,
+    remote_mem_handle: *mut na_mem_handle_t,
+    remote_offset: na_offset_t,
+    length: usize,
+    remote_addr: *mut na_addr_t,
     _remote_id: u8,
-    _op_id: *mut na_op_id_t,
+    op_id: *mut na_op_id_t,
 ) -> na_return_t {
-    // TODO: Write length bytes from (local_mem_handle + local_offset)
-    // to (remote_mem_handle + remote_offset) on remote_addr.
-    // Complete via na_cb_completion_add() when done.
-    NA_PROTOCOL_ERROR
+    let cls = unsafe { get_class(na_class) };
+    let op = unsafe { &mut *(op_id as *mut NaLibp2pOpId) };
+    let local_handle = unsafe { &*(local_mem_handle as *const NaLibp2pMemHandle) };
+    let remote_handle = unsafe { &*(remote_mem_handle as *const NaLibp2pMemHandle) };
+    let dest = unsafe { &*(remote_addr as *const NaLibp2pAddr) };
+
+    op.completion_data.callback = callback;
+    op.completion_data.callback_info.arg = arg;
+    op.completion_data.callback_info.type_ = na_cb_type_NA_CB_PUT;
+    op.context = context;
+
+    // Read data from local buffer
+    let data = if length > 0 && !local_handle.buf.is_null() {
+        let src = unsafe { (local_handle.buf as *const u8).add(local_offset as usize) };
+        unsafe { std::slice::from_raw_parts(src, length).to_vec() }
+    } else {
+        Vec::new()
+    };
+
+    let remote_peer_id = remote_handle
+        .owner_peer_id
+        .unwrap_or(dest.peer_id);
+
+    let _ = cls.cmd_tx.send(Command::RmaPut {
+        remote_peer_id,
+        data,
+        remote_handle_id: remote_handle.handle_id,
+        remote_offset: remote_offset as u64,
+        op_ptr: op_id as usize,
+        source_peer_id: cls.self_addr.peer_id,
+    });
+
+    NA_SUCCESS
 }
 
-/// Initiate a non-blocking RMA get (read from remote memory).
-///
-/// **REQUIRED** for RMA support.
-pub(crate) unsafe extern "C" fn na_abc_get(
-    _na_class: *mut na_class_t,
-    _context: *mut na_context_t,
-    _callback: na_cb_t,
-    _arg: *mut c_void,
-    _local_mem_handle: *mut na_mem_handle_t,
-    _local_offset: na_offset_t,
-    _remote_mem_handle: *mut na_mem_handle_t,
-    _remote_offset: na_offset_t,
-    _length: usize,
-    _remote_addr: *mut na_addr_t,
+pub(crate) unsafe extern "C" fn na_libp2p_get(
+    na_class: *mut na_class_t,
+    context: *mut na_context_t,
+    callback: na_cb_t,
+    arg: *mut c_void,
+    local_mem_handle: *mut na_mem_handle_t,
+    local_offset: na_offset_t,
+    remote_mem_handle: *mut na_mem_handle_t,
+    remote_offset: na_offset_t,
+    length: usize,
+    remote_addr: *mut na_addr_t,
     _remote_id: u8,
-    _op_id: *mut na_op_id_t,
+    op_id: *mut na_op_id_t,
 ) -> na_return_t {
-    // TODO: Read length bytes from (remote_mem_handle + remote_offset)
-    // on remote_addr into (local_mem_handle + local_offset).
-    // Complete via na_cb_completion_add() when done.
-    NA_PROTOCOL_ERROR
+    let cls = unsafe { get_class(na_class) };
+    let op = unsafe { &mut *(op_id as *mut NaLibp2pOpId) };
+    let local_handle = unsafe { &*(local_mem_handle as *const NaLibp2pMemHandle) };
+    let remote_handle = unsafe { &*(remote_mem_handle as *const NaLibp2pMemHandle) };
+    let dest = unsafe { &*(remote_addr as *const NaLibp2pAddr) };
+
+    op.completion_data.callback = callback;
+    op.completion_data.callback_info.arg = arg;
+    op.completion_data.callback_info.type_ = na_cb_type_NA_CB_GET;
+    op.context = context;
+    op.local_handle_id = local_handle.handle_id;
+    op.local_offset = local_offset as u64;
+    op.rma_length = length;
+
+    // Enqueue as pending RMA op
+    cls.queues
+        .lock()
+        .pending_rma_ops
+        .push_back(op_id as *mut NaLibp2pOpId);
+
+    let remote_peer_id = remote_handle
+        .owner_peer_id
+        .unwrap_or(dest.peer_id);
+
+    let _ = cls.cmd_tx.send(Command::RmaGetRequest {
+        remote_peer_id,
+        remote_handle_id: remote_handle.handle_id,
+        remote_offset: remote_offset as u64,
+        length,
+        local_handle_id: local_handle.handle_id,
+        local_offset: local_offset as u64,
+        op_ptr: op_id as usize,
+        source_peer_id: cls.self_addr.peer_id,
+    });
+
+    NA_SUCCESS
 }
 
-// ------------------------------------------------------------------ //
-//  Progress / polling                                                  //
-// ------------------------------------------------------------------ //
+// ---------------------------------------------------------------------------
+//  Progress / polling
+// ---------------------------------------------------------------------------
 
-/// Return a file descriptor that becomes readable when progress can be
-/// made.  Return `-1` if not supported (caller will fall back to
-/// busy-polling).
-///
-/// Optional -- may be `None`.
-pub(crate) unsafe extern "C" fn na_abc_poll_get_fd(
-    _na_class: *mut na_class_t,
+pub(crate) unsafe extern "C" fn na_libp2p_poll_get_fd(
+    na_class: *mut na_class_t,
     _context: *mut na_context_t,
 ) -> std::ffi::c_int {
-    // TODO: Return a file descriptor that can be polled (epoll/select) for
-    // readability to know when progress can be made.  Return -1 if fd-based
-    // notification is not supported.
-    -1
+    let cls = unsafe { get_class(na_class) };
+    cls.event_fd as std::ffi::c_int
 }
 
-/// Return `true` if the caller should enter an OS-level wait
-/// (epoll/poll/select) on the fd returned by `poll_get_fd()`.
-///
-/// Return `false` if there is already work pending.
-///
-/// Optional -- may be `None`.
-pub(crate) unsafe extern "C" fn na_abc_poll_try_wait(
-    _na_class: *mut na_class_t,
+pub(crate) unsafe extern "C" fn na_libp2p_poll_try_wait(
+    na_class: *mut na_class_t,
     _context: *mut na_context_t,
 ) -> bool {
-    // TODO: Return true if it is safe to block on poll_get_fd(); return
-    // false if there is already pending work (so the caller should call
-    // poll() immediately instead of waiting).
-    false
+    let cls = unsafe { get_class(na_class) };
+    let rx = cls.completion_rx.lock();
+    rx.is_empty()
 }
 
-/// Poll for completed operations.
-///
-/// Store the number of completions in `*count_p`.  Return `NA_SUCCESS`
-/// if completions were found, `NA_TIMEOUT` if none.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_poll(
-    _na_class: *mut na_class_t,
+pub(crate) unsafe extern "C" fn na_libp2p_poll(
+    na_class: *mut na_class_t,
     _context: *mut na_context_t,
     count_p: *mut std::ffi::c_uint,
 ) -> na_return_t {
-    // TODO: Check for completed operations and process them.  For each
-    // completion, call na_cb_completion_add().  Store the number of
-    // completions processed in *count_p.
-    if !count_p.is_null() {
-        unsafe { *count_p = 0 };
+    let cls = unsafe { get_class(na_class) };
+    let mut count: u32 = 0;
+
+    runtime::drain_eventfd(cls.event_fd);
+
+    // Drain completion channel
+    {
+        let mut rx = cls.completion_rx.lock();
+        while let Ok(completion) = rx.try_recv() {
+            let op = completion.op_ptr as *mut NaLibp2pOpId;
+            let op_ref = unsafe { &mut *op };
+
+            op_ref.completion_data.callback_info.ret = completion.result;
+
+            if let Some(recv_info) = completion.recv_info {
+                let cb_type = op_ref.completion_data.callback_info.type_;
+                if cb_type == na_cb_type_NA_CB_RECV_UNEXPECTED {
+                    // Copy payload into op's buffer was already done by the
+                    // incoming handler; just set the recv info.
+                    op_ref.completion_data.callback_info.info.recv_unexpected =
+                        na_cb_info_recv_unexpected {
+                            actual_buf_size: recv_info.actual_size,
+                            source: recv_info.source_addr as *mut na_addr_t,
+                            tag: recv_info.tag,
+                        };
+                } else if cb_type == na_cb_type_NA_CB_RECV_EXPECTED {
+                    op_ref.completion_data.callback_info.info.recv_expected =
+                        na_cb_info_recv_expected {
+                            actual_buf_size: recv_info.actual_size,
+                        };
+                    if !recv_info.source_addr.is_null() {
+                        let _ = Box::from_raw(recv_info.source_addr);
+                    }
+                } else {
+                    if !recv_info.source_addr.is_null() {
+                        let _ = Box::from_raw(recv_info.source_addr);
+                    }
+                }
+            }
+
+            unsafe { na_cb_completion_add(op_ref.context, &mut op_ref.completion_data) };
+            count += 1;
+        }
     }
-    NA_TIMEOUT
+
+    if !count_p.is_null() {
+        unsafe { *count_p = count };
+    }
+
+    NA_SUCCESS
 }
 
-/// Cancel an in-flight operation.
-///
-/// On successful cancellation the operation's callback should still be
-/// invoked with `NA_CANCELED` as the return value.
-///
-/// **REQUIRED**.
-pub(crate) unsafe extern "C" fn na_abc_cancel(
-    _na_class: *mut na_class_t,
-    _context: *mut na_context_t,
-    _op_id: *mut na_op_id_t,
+pub(crate) unsafe extern "C" fn na_libp2p_cancel(
+    na_class: *mut na_class_t,
+    context: *mut na_context_t,
+    op_id: *mut na_op_id_t,
 ) -> na_return_t {
-    // TODO: Cancel the in-flight operation identified by op_id.  On
-    // successful cancellation the operation's callback should still be
-    // invoked with NA_CANCELED as the return value.
-    NA_PROTOCOL_ERROR
+    let cls = unsafe { get_class(na_class) };
+    let op_ptr = op_id as *mut NaLibp2pOpId;
+
+    let mut queues = cls.queues.lock();
+
+    // Try unexpected recv queue
+    if let Some(pos) = queues
+        .unexpected_recv_ops
+        .iter()
+        .position(|&p| p == op_ptr)
+    {
+        queues.unexpected_recv_ops.remove(pos);
+        let op = unsafe { &mut *op_ptr };
+        op.completion_data.callback_info.ret = NA_CANCELED;
+        unsafe { na_cb_completion_add(context, &mut op.completion_data) };
+        return NA_SUCCESS;
+    }
+
+    // Try expected recv queue
+    if let Some(pos) = queues
+        .expected_recv_ops
+        .iter()
+        .position(|&p| p == op_ptr)
+    {
+        queues.expected_recv_ops.remove(pos);
+        let op = unsafe { &mut *op_ptr };
+        op.completion_data.callback_info.ret = NA_CANCELED;
+        unsafe { na_cb_completion_add(context, &mut op.completion_data) };
+        return NA_SUCCESS;
+    }
+
+    // Try pending RMA ops
+    if let Some(pos) = queues
+        .pending_rma_ops
+        .iter()
+        .position(|&p| p == op_ptr)
+    {
+        queues.pending_rma_ops.remove(pos);
+        let op = unsafe { &mut *op_ptr };
+        op.completion_data.callback_info.ret = NA_CANCELED;
+        unsafe { na_cb_completion_add(context, &mut op.completion_data) };
+        return NA_SUCCESS;
+    }
+
+    NA_SUCCESS
 }

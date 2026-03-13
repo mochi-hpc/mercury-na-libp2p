@@ -7,8 +7,8 @@
  *  - Self address can be retrieved
  *  - Finalize completes cleanly
  *
- * Usage: test_abc_init [-p <protocol>]
- *   Default protocol is "abc".
+ * Usage: test_libp2p_init [-p <protocol>]
+ *   Default protocol is "libp2p".
  */
 
 #include <na.h>
@@ -22,7 +22,7 @@
 int
 main(int argc, char *argv[])
 {
-    const char *protocol = "abc";
+    const char *protocol = "libp2p";
     char info_string[256];
     na_class_t *na_class;
     na_context_t *context;
