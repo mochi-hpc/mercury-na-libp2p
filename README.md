@@ -91,7 +91,7 @@ cd build
 NA_PLUGIN_PATH=./cargo-build/release ctest --output-on-failure
 ```
 
-Seven test suites are included:
+Eight test suites are included:
 
 | Test | What it covers |
 |------|----------------|
@@ -102,6 +102,7 @@ Seven test suites are included:
 | `libp2p_rpc`       | Full Mercury RPC including 16-thread concurrent progress |
 | `libp2p_bulk`      | RMA put/get bulk data transfer |
 | `libp2p_relay_msg` | Message send/recv over a relayed connection (3-process) |
+| `libp2p_dcutr`     | DCUtR hole-punch: relay killed after lookup, messaging over direct connection |
 
 ## Using the Plugin
 
@@ -266,8 +267,10 @@ na_class_t *na = NA_Initialize("tcp,relay://", NA_FALSE);
 
 The server makes a reservation with the relay and becomes reachable at
 a circuit address. `NA_Addr_self()` returns this circuit address so the
-client can dial through the relay. All subsequent NA operations
-(messaging, RMA) work transparently over the relayed connection.
+client can dial through the relay. During lookup, the plugin attempts
+DCUtR hole-punching to upgrade to a direct connection (see below). All
+subsequent NA operations (messaging, RMA) work transparently regardless
+of whether the connection is direct or relayed.
 
 #### Relay limitations
 
@@ -282,6 +285,26 @@ The relay server uses default libp2p relay v2 limits:
 
 These limits are suitable for control-plane RPC with small messages.
 For bulk data transfer, use direct connections.
+
+#### DCUtR hole-punching
+
+When a peer looks up a relay address (`NA_Addr_lookup` with a `relay:`
+prefix), the plugin automatically attempts
+[DCUtR](https://github.com/libp2p/specs/blob/master/relay/DCUtR.md)
+hole-punching to establish a direct connection. The lookup blocks (up to
+10 seconds) while DCUtR negotiates:
+
+- **Success**: Subsequent messaging uses the direct connection. The relay
+  is no longer in the data path.
+- **Failure / timeout**: The relay connection is used as a fallback.
+  All NA operations continue to work transparently.
+
+DCUtR works well on LANs and HPC clusters where peers are directly
+reachable. In true NAT scenarios (peers behind different NATs without
+port mapping), hole-punching may fail and traffic will stay on the relay.
+
+Non-relay lookups (`tcp:` or `quic:` prefix) are unaffected — they
+return immediately as before.
 
 ### 8. Progress loop
 

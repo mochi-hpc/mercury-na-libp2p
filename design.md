@@ -31,6 +31,7 @@ developers who need to understand, maintain, or extend this codebase.
 20. [Configuration and Tuning](#20-configuration-and-tuning)
 21. [Design Decisions and Trade-offs](#21-design-decisions-and-trade-offs)
 22. [Circuit Relay Transport](#22-circuit-relay-transport)
+23. [DCUtR Hole-Punching](#23-dcutr-hole-punching)
 
 ---
 
@@ -413,10 +414,21 @@ at `/p2p/` to separate the transport multiaddr from the peer ID. The transport
 part is parsed as a `Multiaddr` (supporting any transport: TCP, QUIC, etc.)
 and the peer ID is parsed as a base58 `PeerId`.
 
-If a transport multiaddr is present, `Command::AddKnownAddr` is sent to the
-swarm, which calls `swarm.add_peer_address()` and immediately attempts a dial
-with `PeerCondition::DisconnectedAndNotDialing` to establish the connection
-eagerly.
+If a transport multiaddr is present, the behaviour depends on the address type:
+
+- **Non-relay addresses** (`tcp:` / `quic:` prefix): `Command::AddKnownAddr` is
+  sent to the swarm, which calls `swarm.add_peer_address()` and immediately
+  attempts a dial with `PeerCondition::DisconnectedAndNotDialing`. The call
+  returns immediately (fire-and-forget).
+
+- **Relay addresses** (`relay:` prefix): `Command::ConnectViaRelay` is sent
+  instead. The sync NA thread blocks on a `oneshot::blocking_recv()` until one
+  of the following occurs: (a) DCUtR hole-punching establishes a direct
+  connection (`RelayConnectResult::Direct`), (b) DCUtR fails but the relay
+  connection is usable (`RelayConnectResult::RelayOnly`), or (c) the relay
+  dial itself fails (`RelayConnectResult::Failed`). On `Failed`, the function
+  returns `NA_PROTOCOL_ERROR`. See [section 23](#23-dcutr-hole-punching) for
+  details.
 
 ### Address comparison
 
@@ -1015,9 +1027,10 @@ The swarm also includes:
 - **`relay::client::Behaviour`**: Manages relay reservations and circuit
   connections.
 - **`dcutr::Behaviour`**: Direct Connection Upgrade through Relay — attempts
-  to upgrade a relayed connection to a direct one via hole-punching. If
-  hole-punching fails (common in test environments), communication continues
-  over the relay.
+  to upgrade a relayed connection to a direct one via hole-punching. During
+  `NA_Addr_lookup` with a `relay:` address, the plugin blocks until DCUtR
+  completes or times out (10 s), then falls back to relay if hole-punching
+  failed. See [section 23](#23-dcutr-hole-punching) for details.
 
 ```rust
 MercuryBehaviour {
@@ -1072,8 +1085,8 @@ relay:/ip4/<relay_ip>/tcp/<relay_port>/p2p/<relay_peer_id>/p2p-circuit/p2p/<targ
 The `relay:` prefix is the Mercury transport hint (analogous to `tcp:` or
 `quic:`). During `addr_lookup()`, this prefix is stripped and the remaining
 multiaddr (which includes `/p2p-circuit`) is passed to
-`Command::AddKnownAddr`. The swarm's relay client behaviour recognizes the
-`/p2p-circuit` component and routes the dial through the relay.
+`Command::ConnectViaRelay`. This dials through the relay and attempts DCUtR
+hole-punching before returning (see [section 23](#23-dcutr-hole-punching)).
 
 ### Relay server reconnection
 
@@ -1119,6 +1132,23 @@ test_relay_driver.sh
         initializes with "tcp,relay", exchanges messages through relay
 ```
 
+The DCUtR test (`libp2p_dcutr`) uses a similar 3-process setup orchestrated by
+`test/test_dcutr_driver.sh`:
+
+```
+test_dcutr_driver.sh
+  ├── mercury-na-relay-server
+  │
+  ├── test_libp2p_dcutr_server
+  │     Same as relay server — writes circuit address
+  │
+  └── test_libp2p_dcutr_client
+        1. Looks up server via relay (blocks for DCUtR)
+        2. Signals driver via "dcutr_lookup_done" file
+        3. Driver kills relay, signals via "relay_killed" file
+        4. Exchanges messages — must succeed over direct connection
+```
+
 The relay server (`relay-server/`) is a minimal Rust binary based
 on the upstream `rust-libp2p/examples/relay-server`. It differs from the
 example in two ways:
@@ -1128,3 +1158,142 @@ example in two ways:
    reservations include routable addresses in the response (required by the
    protocol — without external addresses, reservations fail with
    `NoAddressesInReservation`).
+
+---
+
+## 23. DCUtR Hole-Punching
+
+[DCUtR](https://github.com/libp2p/specs/blob/master/relay/DCUtR.md) (Direct
+Connection Upgrade through Relay) allows two peers that initially communicate
+via a relay to establish a direct connection by coordinating a simultaneous
+dial (hole-punch). The plugin integrates DCUtR into `NA_Addr_lookup` so that
+lookups of relay addresses automatically attempt hole-punching before
+returning.
+
+### Motivation
+
+Without DCUtR, all traffic between relay-connected peers flows through the
+relay server, which imposes bandwidth limits (128 KiB per circuit) and adds
+latency. On LANs and HPC clusters — where peers are typically directly
+reachable — DCUtR upgrades the connection to a direct one, eliminating the
+relay from the data path.
+
+### Mechanism
+
+When `NA_Addr_lookup` receives a `relay:`-prefixed address, the following
+sequence occurs:
+
+```
+NA thread (sync)                  Tokio thread (async)
+────────────────                  ────────────────────
+addr_lookup("relay:...")
+  ├─ send ConnectViaRelay ──────► receive command
+  │    { peer_id, addr,             ├─ swarm.dial(circuit_addr)
+  │      result_tx }                │
+  │                                 ├─ ConnectionEstablished (relayed)
+  │                                 │    relay_connected = true
+  │                                 │
+  │                                 ├─ DCUtR negotiation
+  │                                 │    (libp2p exchanges addr
+  │                                 │     candidates, both sides
+  │                                 │     attempt simultaneous dial)
+  │                                 │
+  │                                 ├─ ConnectionEstablished (direct)
+  │                                 │    OR Dcutr::Event { Ok(_) }
+  │                                 │    ── send Direct ──────────►
+  │                                 │
+  ◄── blocking_recv() ────── result_tx.send(Direct)
+  │
+  ├─ return NA_SUCCESS
+```
+
+### Types (`runtime.rs`)
+
+```rust
+pub enum RelayConnectResult {
+    Direct,          // DCUtR succeeded — direct connection established
+    RelayOnly,       // DCUtR failed/timed out — relay usable as fallback
+    Failed(String),  // Could not connect at all (relay dial failed)
+}
+
+pub enum Command {
+    ...
+    ConnectViaRelay {
+        peer_id: PeerId,
+        relay_circuit_addr: Multiaddr,
+        result_tx: oneshot::Sender<RelayConnectResult>,
+    },
+}
+```
+
+### Pending DCUtR tracking
+
+A `PendingDcutr` entry is created for each in-progress relay lookup:
+
+```rust
+struct PendingDcutr {
+    result_tx: Option<oneshot::Sender<RelayConnectResult>>,
+    relay_connected: bool,   // true once the relayed connection is up
+    deadline: Instant,       // now + 10 seconds
+}
+```
+
+These entries live in `pending_dcutr: HashMap<PeerId, PendingDcutr>` inside
+the main event loop.
+
+### Event handling
+
+Multiple swarm events can resolve a pending DCUtR entry. The first one to
+fire wins (the `HashMap::remove` ensures at-most-once delivery):
+
+| Event | Condition | Result |
+|-------|-----------|--------|
+| `ConnectionEstablished` | `endpoint.is_relayed() == true` | Mark `relay_connected = true` (don't resolve yet) |
+| `ConnectionEstablished` | `endpoint.is_relayed() == false` | Resolve with `Direct` |
+| `Dcutr::Event` | `result == Ok(conn_id)` | Resolve with `Direct` |
+| `Dcutr::Event` | `result == Err(e)` | Resolve with `RelayOnly` |
+| `OutgoingConnectionError` | Peer in pending, `relay_connected == false` | Resolve with `Failed` |
+| Timeout (10 s) | `relay_connected == true` | Resolve with `RelayOnly` |
+| Timeout (10 s) | `relay_connected == false` | Resolve with `Failed` |
+
+### PeerSenderPool teardown on DCUtR success
+
+When DCUtR succeeds, the `sender_pool` entry for the peer is removed. This
+drops the mpsc channel, causing the writer task to exit and close the relay
+yamux stream. The next outbound message to that peer will create a new sender
+entry, opening a fresh stream — libp2p routes it over the direct connection.
+
+### External address registration
+
+DCUtR needs each peer to share address candidates with the remote side during
+negotiation. After the primary listen addresses are resolved, non-circuit
+addresses are registered as external:
+
+```rust
+for addr in &resolved {
+    if !addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+        swarm.add_external_address(addr.clone());
+    }
+}
+```
+
+**Limitation:** In true NAT scenarios (where listen addresses are private IPs
+not reachable from the internet), hole-punching will fail because the
+candidates are unreachable. Adding the `identify` protocol (which discovers
+the public IP via the relay) would fix this. For LAN/cluster environments
+(typical Mercury HPC deployments), local addresses work.
+
+### Timeout
+
+The DCUtR timeout is 10 seconds. DCUtR typically completes in 1-3 seconds on
+a LAN. The timeout arm is implemented as a third branch in the
+`tokio::select!` loop, computed from the nearest `pending_dcutr` deadline.
+
+### Blocking semantics
+
+The sync NA thread calls `result_rx.blocking_recv()`, which is safe because
+the NA thread is a regular OS thread (not a tokio task). The async runtime
+resolves the oneshot when any of the above events occurs.
+
+Non-relay lookups (`tcp:` / `quic:` prefix) are unaffected — they continue
+using the existing fire-and-forget `AddKnownAddr` path.

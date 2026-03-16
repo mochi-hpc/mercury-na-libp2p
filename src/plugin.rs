@@ -9,7 +9,7 @@ use tracing::error;
 
 use crate::bindings::*;
 use crate::protocol::MessageType;
-use crate::runtime::{self, Command};
+use crate::runtime::{self, Command, RelayConnectResult};
 use crate::state::*;
 use crate::{NA_CANCELED, NA_INVALID_ARG, NA_NOMEM, NA_OVERFLOW, NA_PROTOCOL_ERROR, NA_SUCCESS};
 
@@ -406,6 +406,7 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_lookup(
 
     // Strip protocol prefix. Mercury strips the "libp2p+" prefix before
     // calling us, so we receive "tcp:/ip4/..." or "quic:/ip4/...".
+    let is_relay = name_str.starts_with("relay:");
     let input = name_str
         .strip_prefix("tcp:")
         .or_else(|| name_str.strip_prefix("quic:"))
@@ -444,14 +445,50 @@ pub(crate) unsafe extern "C" fn na_libp2p_addr_lookup(
         }
     };
 
-    tracing::debug!("addr_lookup: peer_id={peer_id}, transport={transport_ma:?}");
+    tracing::debug!("addr_lookup: peer_id={peer_id}, transport={transport_ma:?}, is_relay={is_relay}");
 
-    // Tell the swarm about this peer's address
-    if let Some(ref ma) = transport_ma {
-        let _ = cls.cmd_tx.send(Command::AddKnownAddr {
+    if is_relay {
+        // Relay address: use blocking ConnectViaRelay + DCUtR hole-punch attempt
+        let relay_circuit_addr = match transport_ma {
+            Some(ref ma) => ma.clone(),
+            None => {
+                error!("addr_lookup: relay address requires a transport multiaddr");
+                return NA_PROTOCOL_ERROR;
+            }
+        };
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let _ = cls.cmd_tx.send(Command::ConnectViaRelay {
             peer_id,
-            multiaddr: ma.clone(),
+            relay_circuit_addr,
+            result_tx,
         });
+
+        // Block the sync NA thread waiting for the relay connect / DCUtR result
+        match result_rx.blocking_recv() {
+            Ok(RelayConnectResult::Direct) => {
+                tracing::info!("addr_lookup: DCUtR succeeded for {peer_id}, using direct connection");
+            }
+            Ok(RelayConnectResult::RelayOnly) => {
+                tracing::info!("addr_lookup: DCUtR failed for {peer_id}, falling back to relay");
+            }
+            Ok(RelayConnectResult::Failed(e)) => {
+                error!("addr_lookup: relay connect failed for {peer_id}: {e}");
+                return NA_PROTOCOL_ERROR;
+            }
+            Err(_) => {
+                error!("addr_lookup: relay connect channel dropped for {peer_id}");
+                return NA_PROTOCOL_ERROR;
+            }
+        }
+    } else {
+        // Non-relay address: fire-and-forget AddKnownAddr
+        if let Some(ref ma) = transport_ma {
+            let _ = cls.cmd_tx.send(Command::AddKnownAddr {
+                peer_id,
+                multiaddr: ma.clone(),
+            });
+        }
     }
 
     let addr = NaLibp2pAddr::alloc_boxed(peer_id, transport_ma, false);

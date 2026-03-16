@@ -36,6 +36,12 @@ struct OutboundMsg {
 //  Commands (NA thread → async)
 // ---------------------------------------------------------------------------
 
+pub enum RelayConnectResult {
+    Direct,       // DCUtR succeeded — direct connection established
+    RelayOnly,    // DCUtR failed/timed out — relay connection usable as fallback
+    Failed(String), // Could not connect at all
+}
+
 pub enum Command {
     SendMessage {
         dest_peer_id: PeerId,
@@ -66,6 +72,11 @@ pub enum Command {
     AddKnownAddr {
         peer_id: PeerId,
         multiaddr: Multiaddr,
+    },
+    ConnectViaRelay {
+        peer_id: PeerId,
+        relay_circuit_addr: Multiaddr,
+        result_tx: tokio::sync::oneshot::Sender<RelayConnectResult>,
     },
     Shutdown,
 }
@@ -395,6 +406,13 @@ pub fn spawn_swarm_task(
             }
         };
 
+        // Register non-circuit listen addresses as external addresses for DCUtR
+        for addr in &resolved {
+            if !addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+                swarm.add_external_address(addr.clone());
+            }
+        }
+
         // Relay initialization: dial the relay server and make a reservation
         if let Some(ref relay_ma) = relay_addr {
             let relay_peer_id = extract_peer_id_from_multiaddr(relay_ma)
@@ -506,12 +524,44 @@ pub fn spawn_swarm_task(
             let mut cmd_rx = cmd_rx;
             let mut sender_pool = PeerSenderPool::new();
 
+            const DCUTR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+            struct PendingDcutr {
+                result_tx: Option<tokio::sync::oneshot::Sender<RelayConnectResult>>,
+                relay_connected: bool,
+                deadline: tokio::time::Instant,
+            }
+
+            let mut pending_dcutr: HashMap<PeerId, PendingDcutr> = HashMap::new();
+
             loop {
+                // Compute next DCUtR deadline for the timeout arm
+                let next_dcutr_deadline = pending_dcutr
+                    .values()
+                    .map(|p| p.deadline)
+                    .min()
+                    .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(86400));
+
                 tokio::select! {
                     event = swarm.next() => {
                         match event {
-                            Some(SwarmEvent::ConnectionEstablished { peer_id, .. }) => {
-                                debug!("Connection established with {peer_id}");
+                            Some(SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. }) => {
+                                debug!("Connection established with {peer_id} (relayed={})", endpoint.is_relayed());
+                                if let Some(pending) = pending_dcutr.get_mut(&peer_id) {
+                                    if endpoint.is_relayed() {
+                                        pending.relay_connected = true;
+                                        info!("Relay connection established with {peer_id}, waiting for DCUtR...");
+                                    } else {
+                                        // Direct connection — DCUtR succeeded (or wasn't needed)
+                                        info!("Direct connection established with {peer_id}, DCUtR succeeded");
+                                        if let Some(mut pending) = pending_dcutr.remove(&peer_id) {
+                                            sender_pool.senders.remove(&peer_id);
+                                            if let Some(tx) = pending.result_tx.take() {
+                                                let _ = tx.send(RelayConnectResult::Direct);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Some(SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. }) => {
                                 warn!("Connection closed with {peer_id} (remaining={num_established}), cause: {cause:?}");
@@ -544,6 +594,21 @@ pub fn spawn_swarm_task(
                             }
                             Some(SwarmEvent::OutgoingConnectionError { peer_id, error, .. }) => {
                                 warn!("Outgoing connection error to {peer_id:?}: {error}");
+                                if let Some(pid) = peer_id {
+                                    if let Some(pending) = pending_dcutr.get(&pid) {
+                                        if !pending.relay_connected {
+                                            // Relay dial itself failed
+                                            if let Some(mut pending) = pending_dcutr.remove(&pid) {
+                                                if let Some(tx) = pending.result_tx.take() {
+                                                    let _ = tx.send(RelayConnectResult::Failed(
+                                                        format!("Relay dial failed: {error}"),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        // If relay_connected, ignore — DCUtR may still succeed
+                                    }
+                                }
                             }
                             Some(SwarmEvent::IncomingConnectionError { error, .. }) => {
                                 warn!("Incoming connection error: {error}");
@@ -552,7 +617,24 @@ pub fn spawn_swarm_task(
                                 info!("Relay client event: {event:?}");
                             }
                             Some(SwarmEvent::Behaviour(MercuryBehaviourEvent::Dcutr(event))) => {
-                                info!("DCUtR event: {event:?}");
+                                info!("DCUtR event: peer={}, result={:?}", event.remote_peer_id, event.result);
+                                if let Some(mut pending) = pending_dcutr.remove(&event.remote_peer_id) {
+                                    match event.result {
+                                        Ok(_conn_id) => {
+                                            info!("DCUtR succeeded for {}", event.remote_peer_id);
+                                            sender_pool.senders.remove(&event.remote_peer_id);
+                                            if let Some(tx) = pending.result_tx.take() {
+                                                let _ = tx.send(RelayConnectResult::Direct);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            info!("DCUtR failed for {}: {e}", event.remote_peer_id);
+                                            if let Some(tx) = pending.result_tx.take() {
+                                                let _ = tx.send(RelayConnectResult::RelayOnly);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Some(SwarmEvent::Behaviour(MercuryBehaviourEvent::Stream(()))) => {}
                             Some(_) => {}
@@ -572,6 +654,30 @@ pub fn spawn_swarm_task(
                                     .build();
                                 if let Err(e) = swarm.dial(dial_opts) {
                                     warn!("Failed to dial {peer_id}: {e}");
+                                }
+                            }
+                            Some(Command::ConnectViaRelay { peer_id, relay_circuit_addr, result_tx }) => {
+                                info!("ConnectViaRelay: dialing {peer_id} via {relay_circuit_addr}");
+                                shared.peer_addrs.lock().insert(peer_id, relay_circuit_addr.clone());
+                                swarm.add_peer_address(peer_id, relay_circuit_addr.clone());
+                                let dial_opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+                                    .addresses(vec![relay_circuit_addr])
+                                    .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                                    .build();
+                                match swarm.dial(dial_opts) {
+                                    Ok(()) => {
+                                        pending_dcutr.insert(peer_id, PendingDcutr {
+                                            result_tx: Some(result_tx),
+                                            relay_connected: false,
+                                            deadline: tokio::time::Instant::now() + DCUTR_TIMEOUT,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!("ConnectViaRelay: dial failed for {peer_id}: {e}");
+                                        let _ = result_tx.send(RelayConnectResult::Failed(
+                                            format!("Dial failed: {e}"),
+                                        ));
+                                    }
                                 }
                             }
                             Some(Command::SendMessage { dest_peer_id, msg_type, tag, payload, op_ptr, source_peer_id }) => {
@@ -718,6 +824,29 @@ pub fn spawn_swarm_task(
                                         signal_eventfd(shared.event_fd);
                                     }
                                 });
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(next_dcutr_deadline) => {
+                        let now = tokio::time::Instant::now();
+                        let expired: Vec<PeerId> = pending_dcutr
+                            .iter()
+                            .filter(|(_, p)| p.deadline <= now)
+                            .map(|(pid, _)| *pid)
+                            .collect();
+                        for pid in expired {
+                            if let Some(mut pending) = pending_dcutr.remove(&pid) {
+                                if let Some(tx) = pending.result_tx.take() {
+                                    if pending.relay_connected {
+                                        info!("DCUtR timeout for {pid}, relay connection usable");
+                                        let _ = tx.send(RelayConnectResult::RelayOnly);
+                                    } else {
+                                        info!("DCUtR timeout for {pid}, no relay connection either");
+                                        let _ = tx.send(RelayConnectResult::Failed(
+                                            format!("Timed out connecting to {pid} via relay"),
+                                        ));
+                                    }
+                                }
                             }
                         }
                     }

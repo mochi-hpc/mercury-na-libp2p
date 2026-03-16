@@ -129,3 +129,26 @@ set_tests_properties(libp2p_relay_msg
     PROPERTIES
         ENVIRONMENT "NA_PLUGIN_PATH=${_na_plugin_dir}"
         TIMEOUT 60)
+
+# DCUtR hole-punch verification test executables
+add_executable(test_libp2p_dcutr_server test_libp2p_dcutr_server.c)
+target_link_libraries(test_libp2p_dcutr_server PRIVATE na)
+
+add_executable(test_libp2p_dcutr_client test_libp2p_dcutr_client.c)
+target_link_libraries(test_libp2p_dcutr_client PRIVATE na)
+
+# DCUtR test: relay is killed after lookup, messaging must work over direct connection
+set(TEST_DCUTR_DRIVER ${CMAKE_CURRENT_SOURCE_DIR}/test_dcutr_driver.sh)
+
+add_test(NAME libp2p_dcutr
+    COMMAND ${TEST_DCUTR_DRIVER}
+        ${_relay_server_bin} --port 0 --secret-key-seed 1 --addr-file relay_addr.txt --
+        $<TARGET_FILE:test_libp2p_dcutr_server> -p "tcp,relay" --
+        $<TARGET_FILE:test_libp2p_dcutr_client> -p "tcp,relay")
+add_dependencies(test_libp2p_dcutr_server mercury_na_relay_server)
+add_dependencies(test_libp2p_dcutr_client mercury_na_relay_server)
+
+set_tests_properties(libp2p_dcutr
+    PROPERTIES
+        ENVIRONMENT "NA_PLUGIN_PATH=${_na_plugin_dir}"
+        TIMEOUT 90)
