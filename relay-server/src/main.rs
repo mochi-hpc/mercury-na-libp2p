@@ -22,8 +22,21 @@ fn generate_ed25519(seed: u8) -> identity::Keypair {
     identity::Keypair::ed25519_from_bytes(bytes).expect("only errors on wrong length")
 }
 
+fn print_usage(program: &str) {
+    eprintln!("Usage: {program} [OPTIONS]");
+    eprintln!();
+    eprintln!("A libp2p relay server for Mercury NA plugin tests.");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --port <PORT>              TCP port to listen on (default: 0, OS-assigned)");
+    eprintln!("  --secret-key-seed <SEED>   Seed byte (0-255) for deterministic Ed25519 keypair (required)");
+    eprintln!("  --addr-file <PATH>         File to write the full listening multiaddr to (required)");
+    eprintln!("  -h, --help                 Print this help message and exit");
+}
+
 fn parse_args() -> (u16, u8, String) {
     let args: Vec<String> = std::env::args().collect();
+    let program = args.first().map(|s| s.as_str()).unwrap_or("mercury-na-relay-server");
     let mut port: u16 = 0;
     let mut seed: Option<u8> = None;
     let mut addr_file: Option<String> = None;
@@ -31,29 +44,42 @@ fn parse_args() -> (u16, u8, String) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "-h" | "--help" => {
+                print_usage(program);
+                std::process::exit(0);
+            }
             "--port" => {
                 i += 1;
-                port = args[i].parse().expect("invalid port");
+                port = args.get(i).expect("--port requires a value")
+                    .parse().expect("invalid port");
             }
             "--secret-key-seed" => {
                 i += 1;
-                seed = Some(args[i].parse().expect("invalid seed"));
+                seed = Some(args.get(i).expect("--secret-key-seed requires a value")
+                    .parse().expect("invalid seed"));
             }
             "--addr-file" => {
                 i += 1;
-                addr_file = Some(args[i].clone());
+                addr_file = Some(args.get(i).expect("--addr-file requires a value").clone());
             }
             other => {
                 eprintln!("Unknown argument: {other}");
+                eprintln!();
+                print_usage(program);
                 std::process::exit(1);
             }
         }
         i += 1;
     }
 
-    let seed = seed.expect("--secret-key-seed is required");
-    let addr_file = addr_file.expect("--addr-file is required");
-    (port, seed, addr_file)
+    if seed.is_none() || addr_file.is_none() {
+        eprintln!("Error: --secret-key-seed and --addr-file are required");
+        eprintln!();
+        print_usage(program);
+        std::process::exit(1);
+    }
+
+    (port, seed.unwrap(), addr_file.unwrap())
 }
 
 #[tokio::main]

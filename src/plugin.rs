@@ -161,7 +161,7 @@ pub(crate) unsafe extern "C" fn na_libp2p_initialize(
         };
 
     // Pick the priority transport's address as the self address.
-    let self_ma = resolve_self_multiaddr(&resolved_addrs, transport_config.priority, transport_config.relay);
+    let self_ma = resolve_self_multiaddr(&resolved_addrs, transport_config.priority);
 
     // Resolve all listen addrs (replace 0.0.0.0 with concrete IP)
     let all_listen_addrs: Vec<Multiaddr> = resolved_addrs
@@ -248,22 +248,14 @@ fn parse_transport_config(protocol_name: &str) -> TransportConfig {
 
 /// Pick the self-address from the resolved listen addresses based on the
 /// priority transport. If the IP is 0.0.0.0, resolves to a concrete address.
-/// When relay is enabled, prefer the circuit address.
+/// The relay address is only returned when explicitly requested via the
+/// buffer hint in addr_to_string; the default self-address always follows
+/// the priority transport.
 fn resolve_self_multiaddr(
     resolved_addrs: &[Multiaddr],
     priority: crate::state::TransportKind,
-    relay: bool,
 ) -> Multiaddr {
     use crate::state::TransportKind;
-
-    if relay {
-        if let Some(addr) = resolved_addrs.iter().find(|a| {
-            a.iter()
-                .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
-        }) {
-            return resolve_multiaddr(addr);
-        }
-    }
 
     let addr = match priority {
         TransportKind::Tcp => resolved_addrs
