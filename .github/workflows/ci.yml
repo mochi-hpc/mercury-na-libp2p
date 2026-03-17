@@ -44,7 +44,7 @@ jobs:
       - name: Build Mercury from source
         if: steps.cache-mercury.outputs.cache-hit != 'true'
         run: |
-          git clone --depth 1 https://github.com/mercury-hpc/mercury.git /tmp/mercury
+          git clone --depth 1 --recursive https://github.com/mercury-hpc/mercury.git /tmp/mercury
           cmake -S /tmp/mercury -B /tmp/mercury-build \
             -DCMAKE_INSTALL_PREFIX=$HOME/mercury-install \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
